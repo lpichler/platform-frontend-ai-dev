@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Seed the memory database with historical data from the bot's PoC work."""
+
 import asyncio
 import json
 import os
@@ -15,7 +16,7 @@ async def main():
     conn = await asyncpg.connect(url)
 
     # Run schema and register vector type
-    schema = (Path(__file__).parent / "src" / "schema.sql").read_text()
+    schema = (Path(__file__).parent / "bot_memory_server" / "schema.sql").read_text()
     await conn.execute(schema)
     await register_vector(conn)
 
@@ -36,7 +37,11 @@ async def main():
                 INSERT INTO tasks (jira_key, status, repo, branch, pr_number, created_at, last_addressed, paused_reason)
                 VALUES ($1, $2::task_status, $3, $4, $5, $6::timestamptz, $7::timestamptz, $8)
                 """,
-                jira_key, status, pr.get("repo"), pr.get("branch"), pr.get("pr"),
+                jira_key,
+                status,
+                pr.get("repo"),
+                pr.get("branch"),
+                pr.get("pr"),
                 datetime.fromisoformat(pr.get("created", "2026-03-19T00:00:00Z").replace("Z", "+00:00")),
                 datetime.fromisoformat(pr.get("lastAddressed", "2026-03-19T00:00:00Z").replace("Z", "+00:00")),
                 pr.get("paused"),
@@ -45,38 +50,84 @@ async def main():
 
     # --- Seed completed tasks from report ---
     completed_tasks = [
-        {"jira_key": "RHCLOUD-46165", "repo": "widget-layout", "branch": "bot/RHCLOUD-46165",
-         "status": "done", "created": "2026-03-19T00:00:00+00:00",
-         "title": "Upgrade frontend-components-notifications for alert fix",
-         "summary": "Bumped @redhat-cloud-services/frontend-components-notifications to fix danger alert variant in notification banner. Package version bump only, no code changes."},
-        {"jira_key": "RHCLOUD-46011", "repo": "astro-virtual-assistant-frontend", "branch": "bot/RHCLOUD-46011",
-         "status": "done", "pr_number": 368, "pr_url": "https://github.com/RedHatInsights/astro-virtual-assistant-frontend/pull/368", "created": "2026-03-19T15:31:00+00:00",
-         "title": "Move VA to top of assistant dropdown",
-         "summary": "PR merged. Reordered addHook calls in useAsyncManagers so VA is registered first, making it appear at the top of the Chameleon dropdown."},
-        {"jira_key": "RHCLOUD-37880", "repo": "notifications-frontend", "branch": "bot/RHCLOUD-37880",
-         "status": "done", "pr_number": 878, "pr_url": "https://github.com/RedHatInsights/notifications-frontend/pull/878", "created": "2026-03-26T10:00:00+00:00",
-         "title": "Fix bulk select text truncation in notification drawer",
-         "summary": "PR merged. Added flex-shrink: 0 CSS fix for PF6 notification drawer bulk select menu toggle. Prevents '50 selected' count text from being truncated."},
-        {"jira_key": "RHCLOUD-43838", "repo": "payload-tracker-frontend", "branch": None,
-         "status": "done", "created": "2026-03-20T00:00:00+00:00",
-         "title": "CVE: node-forge vulnerability in payload-tracker",
-         "summary": "Closed as already fixed. Ran npm ls and npm audit — node-forge vulnerability was already patched via transitive dependency update."},
-        {"jira_key": "RHCLOUD-44642", "repo": "pdf-generator", "branch": None,
-         "status": "done", "created": "2026-03-20T00:00:00+00:00",
-         "title": "CVE: node-tar vulnerability in pdf-generator",
-         "summary": "Closed as already fixed. The node-tar vulnerability was already resolved in the existing lockfile."},
-        {"jira_key": "RHCLOUD-44644", "repo": "payload-tracker-frontend", "branch": "bot/RHCLOUD-44644",
-         "status": "done", "created": "2026-03-20T00:00:00+00:00",
-         "title": "CVE-2026-24842: node-tar lockfile update",
-         "summary": "Fixed via npm lockfile update. Ran npm update node-tar, verified with npm audit, committed updated package-lock.json."},
-        {"jira_key": "RHCLOUD-45698", "repo": "chrome-service-backend", "branch": None,
-         "status": "done", "created": "2026-03-21T00:00:00+00:00",
-         "title": "Add grype scanning to chrome-service-backend",
-         "summary": "Closed as already implemented. Grype scanning workflow was already present in the repo."},
-        {"jira_key": "RHCLOUD-46251", "repo": "learning-resources", "branch": "bot/RHCLOUD-46251",
-         "status": "pr_open", "pr_number": 279, "pr_url": "https://github.com/RedHatInsights/learning-resources/pull/279", "created": "2026-03-26T00:00:00+00:00",
-         "title": "Fix flaky Playwright e2e test counts",
-         "summary": "PR closed by reviewer. Hardcoded baseline counts in Playwright tests broke when backend seeding changed. Reviewer said to address tolerances in a separate PR."},
+        {
+            "jira_key": "RHCLOUD-46165",
+            "repo": "widget-layout",
+            "branch": "bot/RHCLOUD-46165",
+            "status": "done",
+            "created": "2026-03-19T00:00:00+00:00",
+            "title": "Upgrade frontend-components-notifications for alert fix",
+            "summary": "Bumped @redhat-cloud-services/frontend-components-notifications to fix danger alert variant in notification banner. Package version bump only, no code changes.",
+        },
+        {
+            "jira_key": "RHCLOUD-46011",
+            "repo": "astro-virtual-assistant-frontend",
+            "branch": "bot/RHCLOUD-46011",
+            "status": "done",
+            "pr_number": 368,
+            "pr_url": "https://github.com/RedHatInsights/astro-virtual-assistant-frontend/pull/368",
+            "created": "2026-03-19T15:31:00+00:00",
+            "title": "Move VA to top of assistant dropdown",
+            "summary": "PR merged. Reordered addHook calls in useAsyncManagers so VA is registered first, making it appear at the top of the Chameleon dropdown.",
+        },
+        {
+            "jira_key": "RHCLOUD-37880",
+            "repo": "notifications-frontend",
+            "branch": "bot/RHCLOUD-37880",
+            "status": "done",
+            "pr_number": 878,
+            "pr_url": "https://github.com/RedHatInsights/notifications-frontend/pull/878",
+            "created": "2026-03-26T10:00:00+00:00",
+            "title": "Fix bulk select text truncation in notification drawer",
+            "summary": "PR merged. Added flex-shrink: 0 CSS fix for PF6 notification drawer bulk select menu toggle. Prevents '50 selected' count text from being truncated.",
+        },
+        {
+            "jira_key": "RHCLOUD-43838",
+            "repo": "payload-tracker-frontend",
+            "branch": None,
+            "status": "done",
+            "created": "2026-03-20T00:00:00+00:00",
+            "title": "CVE: node-forge vulnerability in payload-tracker",
+            "summary": "Closed as already fixed. Ran npm ls and npm audit — node-forge vulnerability was already patched via transitive dependency update.",
+        },
+        {
+            "jira_key": "RHCLOUD-44642",
+            "repo": "pdf-generator",
+            "branch": None,
+            "status": "done",
+            "created": "2026-03-20T00:00:00+00:00",
+            "title": "CVE: node-tar vulnerability in pdf-generator",
+            "summary": "Closed as already fixed. The node-tar vulnerability was already resolved in the existing lockfile.",
+        },
+        {
+            "jira_key": "RHCLOUD-44644",
+            "repo": "payload-tracker-frontend",
+            "branch": "bot/RHCLOUD-44644",
+            "status": "done",
+            "created": "2026-03-20T00:00:00+00:00",
+            "title": "CVE-2026-24842: node-tar lockfile update",
+            "summary": "Fixed via npm lockfile update. Ran npm update node-tar, verified with npm audit, committed updated package-lock.json.",
+        },
+        {
+            "jira_key": "RHCLOUD-45698",
+            "repo": "chrome-service-backend",
+            "branch": None,
+            "status": "done",
+            "created": "2026-03-21T00:00:00+00:00",
+            "title": "Add grype scanning to chrome-service-backend",
+            "summary": "Closed as already implemented. Grype scanning workflow was already present in the repo.",
+        },
+        {
+            "jira_key": "RHCLOUD-46251",
+            "repo": "learning-resources",
+            "branch": "bot/RHCLOUD-46251",
+            "status": "pr_open",
+            "pr_number": 279,
+            "pr_url": "https://github.com/RedHatInsights/learning-resources/pull/279",
+            "created": "2026-03-26T00:00:00+00:00",
+            "title": "Fix flaky Playwright e2e test counts",
+            "summary": "PR closed by reviewer. Hardcoded baseline counts in Playwright tests broke when backend seeding changed. Reviewer said to address tolerances in a separate PR.",
+        },
     ]
 
     for t in completed_tasks:
@@ -89,15 +140,21 @@ async def main():
             INSERT INTO tasks (jira_key, status, repo, branch, pr_number, pr_url, title, summary, created_at, last_addressed)
             VALUES ($1, $2::task_status, $3, $4, $5, $6, $7, $8, $9, $9)
             """,
-            t["jira_key"], t["status"], t["repo"], t.get("branch"),
-            t.get("pr_number"), t.get("pr_url"), t.get("title"), t.get("summary"),
+            t["jira_key"],
+            t["status"],
+            t["repo"],
+            t.get("branch"),
+            t.get("pr_number"),
+            t.get("pr_url"),
+            t.get("title"),
+            t.get("summary"),
             datetime.fromisoformat(t["created"]),
         )
         print(f"  Task: {t['jira_key']} ({t['status']})")
 
     # --- Seed memories ---
     # Load embedding model
-    from src.embeddings import embed
+    from bot_memory_server.embeddings import embed
 
     memories = [
         # Learnings from completed tickets
@@ -158,7 +215,6 @@ async def main():
             "content": "For both RHCLOUD-43838 (CVE node-forge), RHCLOUD-44642 (CVE node-tar in pdf-generator), and RHCLOUD-45698 (grype scanning in chrome-service), the fix was already in place. Always check current state before starting work — run npm audit, check if workflows already exist, verify package versions. Closing as already-fixed saves significant time.",
             "tags": ["triage", "cve", "ci"],
         },
-
         # Review feedback learnings
         {
             "category": "review_feedback",
@@ -196,7 +252,6 @@ async def main():
             "tags": ["review-feedback", "process", "ux"],
             "metadata": {"pr_url": "https://github.com/RedHatInsights/astro-virtual-assistant-frontend/pull/371"},
         },
-
         # Codebase patterns
         {
             "category": "codebase_pattern",
@@ -225,7 +280,6 @@ async def main():
             "content": "When PR CI checks fail, always check if the same checks also fail on the default branch (main/master). If they do, the failure is pre-existing and not caused by the PR. Use 'gh pr checks <number>' on the PR and compare with the default branch. This prevents wasted effort fixing CI issues outside the PR's scope.",
             "tags": ["ci", "process"],
         },
-
         # Additional learnings from remaining tickets
         {
             "category": "learning",
@@ -288,7 +342,7 @@ async def main():
         {
             "category": "learning",
             "title": "Bot workflow: never commit screenshots to repos",
-            "content": "The bot initially committed PNG screenshots to PR branches and used relative image paths in PR descriptions. Both are wrong. Screenshots must be base64-encoded and embedded in PR comments using <img src=\"data:image/png;base64,...\">. Never commit binary files to the repo for verification purposes.",
+            "content": 'The bot initially committed PNG screenshots to PR branches and used relative image paths in PR descriptions. Both are wrong. Screenshots must be base64-encoded and embedded in PR comments using <img src="data:image/png;base64,...">. Never commit binary files to the repo for verification purposes.',
             "tags": ["process", "bot-workflow"],
         },
         {
@@ -312,9 +366,7 @@ async def main():
     ]
 
     for m in memories:
-        existing = await conn.fetchrow(
-            "SELECT id FROM memories WHERE title = $1", m["title"]
-        )
+        existing = await conn.fetchrow("SELECT id FROM memories WHERE title = $1", m["title"])
         if existing:
             print(f"  Memory '{m['title'][:50]}...' already exists, skipping")
             continue

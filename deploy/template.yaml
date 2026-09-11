@@ -1,0 +1,430 @@
+apiVersion: template.openshift.io/v1
+kind: Template
+metadata:
+  name: platform-frontend-ai-dev
+parameters:
+- name: NAMESPACE
+  value: ${NAMESPACE}
+- name: MEMORY_SERVER_IMAGE
+  value: quay.io/redhat-services-prod/hcc-platex-services/platform-frontend-ai-dev-memory-server
+- name: PROXY_IMAGE
+  value: quay.io/redhat-services-prod/hcc-platex-services/platform-frontend-ai-dev-proxy
+- name: MEMORY_SERVER_IMAGE_TAG
+  required: true
+- name: PROXY_IMAGE_TAG
+  required: true
+- name: GCP_PROJECT_ID
+  required: true
+- name: GCP_REGION
+  required: true
+- name: VERTEX_ALLOWED_MODELS
+  required: true
+- name: PROXY_NAME
+  value: devbot-proxy
+- name: JIRA_SECRET_NAME
+  value: devbot-secrets
+objects:
+
+# ============================================================================
+# Shared infrastructure for dev-bot instances (memory-server + proxy).
+# Bot pods are deployed by instance-specific repos/templates.
+#
+# Prerequisites:
+#
+# 1. RDS instance with the pgvector extension enabled
+# 2. Secret "devbot-secrets" (Vault) with the following keys:
+#      bot-gh-username       — GitHub username / git name
+#      bot-email             — GitHub email for git commits
+#      bot-gl-name           — GitLab username / git name
+#      bot-gl-email          — GitLab email for git commits
+#      gh-bot-gpg-private    — GPG private key (base64)
+#      gh-bot-cli-token      — GitHub personal access token
+#      gl-bot-cli-token      — GitLab personal access token
+#      gcp-vertex-claude-sa  — Google service account key (base64)
+#      jira-email            — Jira username/email (unless JIRA_SECRET_NAME overrides)
+#      jira-token            — Jira API token (unless JIRA_SECRET_NAME overrides)
+#      upload-memory-password — (temporary) shared secret for bulk memory upload
+#      konflux-read-token    — (optional) KubeArchive SA token for Konflux build logs
+# 3. (Optional) Separate Jira secret (JIRA_SECRET_NAME) with keys:
+#      jira-email            — Jira username/email for this instance
+#      jira-token            — Jira API token for this instance
+#
+# ============================================================================
+
+# --- Memory Server Deployment ---
+- apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    name: devbot-memory-server
+    labels:
+      app.kubernetes.io/name: memory-server
+      app.kubernetes.io/part-of: devbot
+  spec:
+    replicas: 1
+    strategy:
+      type: RollingUpdate
+      rollingUpdate:
+        maxUnavailable: 0
+        maxSurge: 1
+    selector:
+      matchLabels:
+        app.kubernetes.io/name: memory-server
+    template:
+      metadata:
+        labels:
+          app.kubernetes.io/name: memory-server
+          app.kubernetes.io/part-of: devbot
+      spec:
+        containers:
+        - name: memory-server
+          image: ${MEMORY_SERVER_IMAGE}:${MEMORY_SERVER_IMAGE_TAG}
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            seccompProfile:
+              type: RuntimeDefault
+            capabilities:
+              drop: ["ALL"]
+          ports:
+          - containerPort: 8080
+            name: http
+            protocol: TCP
+          - containerPort: 9091
+            name: metrics
+            protocol: TCP
+          env:
+          - name: PGSQL_HOSTNAME
+            valueFrom:
+              secretKeyRef:
+                name: platform-frontend-ai-dev-rds
+                key: db.host
+          - name: PGSQL_PORT
+            valueFrom:
+              secretKeyRef:
+                name: platform-frontend-ai-dev-rds
+                key: db.port
+          - name: PGSQL_USER
+            valueFrom:
+              secretKeyRef:
+                name: platform-frontend-ai-dev-rds
+                key: db.user
+          - name: PGSQL_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: platform-frontend-ai-dev-rds
+                key: db.password
+          - name: PGSQL_DATABASE
+            valueFrom:
+              secretKeyRef:
+                name: platform-frontend-ai-dev-rds
+                key: db.name
+          - name: PGSQL_SSLMODE
+            value: require
+          - name: UPLOAD_MEMORY_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: devbot-secrets
+                key: upload-memory-password
+                optional: true
+          - name: KUBEARCHIVE_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: devbot-secrets
+                key: konflux-read-token
+                optional: true
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            failureThreshold: 30
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 2Gi
+            limits:
+              cpu: 500m
+              memory: 4Gi
+
+# --- Memory Server Service ---
+- apiVersion: v1
+  kind: Service
+  metadata:
+    name: devbot-memory-server
+    labels:
+      app.kubernetes.io/name: memory-server
+      app.kubernetes.io/part-of: devbot
+  spec:
+    type: ClusterIP
+    selector:
+      app.kubernetes.io/name: memory-server
+    ports:
+    - port: 8080
+      targetPort: http
+      protocol: TCP
+      name: http
+    - port: 9091
+      targetPort: metrics
+      protocol: TCP
+      name: metrics
+
+# --- Memory Server Route (dashboard + health) ---
+- apiVersion: route.openshift.io/v1
+  kind: Route
+  metadata:
+    name: devbot-memory-server
+    labels:
+      app.kubernetes.io/name: memory-server
+      app.kubernetes.io/part-of: devbot
+  spec:
+    to:
+      kind: Service
+      name: devbot-memory-server
+    port:
+      targetPort: http
+    tls:
+      termination: edge
+      insecureEdgeTerminationPolicy: Redirect
+
+# --- Proxy Deployment (Squid + Executor server — holds all CLI secrets) ---
+- apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    name: ${PROXY_NAME}
+    labels:
+      app.kubernetes.io/name: ${PROXY_NAME}
+      app.kubernetes.io/part-of: devbot
+  spec:
+    replicas: 1
+    strategy:
+      type: RollingUpdate
+      rollingUpdate:
+        maxUnavailable: 0
+        maxSurge: 1
+    selector:
+      matchLabels:
+        app.kubernetes.io/name: ${PROXY_NAME}
+    template:
+      metadata:
+        labels:
+          app.kubernetes.io/name: ${PROXY_NAME}
+          app.kubernetes.io/part-of: devbot
+      spec:
+        containers:
+        - name: proxy
+          image: ${PROXY_IMAGE}:${PROXY_IMAGE_TAG}
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            seccompProfile:
+              type: RuntimeDefault
+            capabilities:
+              drop: ["ALL"]
+          ports:
+          - containerPort: 3128
+            name: squid
+            protocol: TCP
+          - containerPort: 9090
+            name: executor
+            protocol: TCP
+          - containerPort: 8443
+            name: vertex-auth
+            protocol: TCP
+          - containerPort: 8444
+            name: jira-mcp
+            protocol: TCP
+          - containerPort: 8446
+            name: screenshot
+            protocol: TCP
+          - containerPort: 9091
+            name: metrics
+            protocol: TCP
+          env:
+          - name: EXECUTOR_LISTEN
+            value: ":9090"
+          - name: GH_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: devbot-secrets
+                key: gh-bot-cli-token
+          - name: GH_USERNAME
+            valueFrom:
+              secretKeyRef:
+                name: devbot-secrets
+                key: bot-gh-username
+          - name: GITLAB_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: devbot-secrets
+                key: gl-bot-cli-token
+          - name: GL_USERNAME
+            valueFrom:
+              secretKeyRef:
+                name: devbot-secrets
+                key: bot-gl-name
+          - name: GPG_PRIVATE_KEY_B64
+            valueFrom:
+              secretKeyRef:
+                name: devbot-secrets
+                key: gh-bot-gpg-private
+          - name: GOOGLE_SA_KEY_B64
+            valueFrom:
+              secretKeyRef:
+                name: devbot-secrets
+                key: gcp-vertex-claude-sa
+          - name: GCP_PROJECT_ID
+            value: ${GCP_PROJECT_ID}
+          - name: GCP_REGION
+            value: ${GCP_REGION}
+          - name: VERTEX_ALLOWED_MODELS
+            value: ${VERTEX_ALLOWED_MODELS}
+          - name: JIRA_URL
+            value: https://redhat.atlassian.net
+          - name: JIRA_USERNAME
+            valueFrom:
+              secretKeyRef:
+                name: ${JIRA_SECRET_NAME}
+                key: jira-email
+          - name: JIRA_API_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: ${JIRA_SECRET_NAME}
+                key: jira-token
+          livenessProbe:
+            tcpSocket:
+              port: 3128
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          readinessProbe:
+            tcpSocket:
+              port: 3128
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 300m
+              memory: 256Mi
+
+# --- Proxy Service ---
+- apiVersion: v1
+  kind: Service
+  metadata:
+    name: ${PROXY_NAME}
+    labels:
+      app.kubernetes.io/name: ${PROXY_NAME}
+      app.kubernetes.io/part-of: devbot
+  spec:
+    type: ClusterIP
+    selector:
+      app.kubernetes.io/name: ${PROXY_NAME}
+    ports:
+    - port: 3128
+      targetPort: squid
+      protocol: TCP
+      name: squid
+    - port: 9090
+      targetPort: executor
+      protocol: TCP
+      name: executor
+    - port: 8443
+      targetPort: vertex-auth
+      protocol: TCP
+      name: vertex-auth
+    - port: 8444
+      targetPort: jira-mcp
+      protocol: TCP
+      name: jira-mcp
+    - port: 8446
+      targetPort: screenshot
+      protocol: TCP
+      name: screenshot
+    - port: 9091
+      targetPort: metrics
+      protocol: TCP
+      name: metrics
+
+# --- NetworkPolicy: Proxy accepts ingress from bot pods ---
+- apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata:
+    name: ${PROXY_NAME}-ingress
+    labels:
+      app.kubernetes.io/part-of: devbot
+  spec:
+    podSelector:
+      matchLabels:
+        app.kubernetes.io/name: ${PROXY_NAME}
+    policyTypes:
+    - Ingress
+    ingress:
+    - from:
+      - podSelector:
+          matchLabels:
+            app.kubernetes.io/part-of: devbot
+      ports:
+      - port: 3128
+        protocol: TCP
+      - port: 9090
+        protocol: TCP
+      - port: 8443
+        protocol: TCP
+      - port: 8444
+        protocol: TCP
+      - port: 8446
+        protocol: TCP
+    - from:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: openshift-customer-monitoring
+      ports:
+      - port: 9091
+        protocol: TCP
+
+# --- NetworkPolicy: Memory server accepts ingress from bot pods + OpenShift router ---
+- apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata:
+    name: devbot-memory-server-ingress
+    labels:
+      app.kubernetes.io/part-of: devbot
+  spec:
+    podSelector:
+      matchLabels:
+        app.kubernetes.io/name: memory-server
+    policyTypes:
+    - Ingress
+    ingress:
+    - from:
+      - podSelector:
+          matchLabels:
+            app.kubernetes.io/part-of: devbot
+      ports:
+      - port: 8080
+        protocol: TCP
+    - from:
+      - namespaceSelector:
+          matchLabels:
+            network.openshift.io/policy-group: ingress
+      ports:
+      - port: 8080
+        protocol: TCP
+    - from:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: openshift-customer-monitoring
+      ports:
+      - port: 9091
+        protocol: TCP

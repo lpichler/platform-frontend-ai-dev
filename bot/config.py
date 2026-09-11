@@ -1,10 +1,18 @@
 """Configuration loading for the dev bot."""
 
+from __future__ import annotations
+
 import json
+import logging
 import os
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+import yaml
+
+from .constants import _DEFAULT_COOLDOWN_SECONDS
 
 
 @dataclass
@@ -13,7 +21,121 @@ class Config:
     max_turns: int
     interval: int
     idle_interval: int
+    cycle_timeout: int
     board_key: str
+    idle_reminder_cooldown_seconds: int = _DEFAULT_COOLDOWN_SECONDS
+
+
+@dataclass
+class InstanceConfig:
+    """Per-instance preset selection from instance.yaml or env var fallback."""
+
+    workflow: str = "jira-sprint"
+    source: str = "jira"
+    envs: list[str] | None = None  # None = all available, [] = none
+    claude_md_strategy: str = "ignore"  # replace / append / ignore
+    idle_cycle_limit: int = 0  # 0 = feature disabled
+
+    @classmethod
+    def from_yaml(cls, path: Path) -> InstanceConfig:
+        with open(path) as f:
+            data = yaml.safe_load(f) or {}
+        claude_md = data.get("claude_md")
+        strategy = claude_md.get("strategy", "ignore") if isinstance(claude_md, dict) else "ignore"
+        return cls(
+            workflow=data.get("workflow", "jira-sprint"),
+            source=data.get("source", "jira"),
+            envs=data.get("envs"),
+            claude_md_strategy=strategy,
+            idle_cycle_limit=int(data.get("idle_cycle_limit", 0)),
+        )
+
+    @classmethod
+    def from_env(cls) -> InstanceConfig:
+        workflow = os.environ.get("BOT_WORKFLOW_PRESET", "jira-sprint")
+        envs_str = os.environ.get("BOT_ENV_PRESETS")
+        envs: list[str] | None = None
+        if envs_str is not None:
+            envs = [e.strip() for e in envs_str.split(",") if e.strip()]
+        return cls(workflow=workflow, envs=envs)
+
+
+def load_instance_config(remote_agent_dir: Path | None) -> InstanceConfig:
+    """Load instance.yaml from remote config, or fall back to env vars/defaults."""
+    logger = logging.getLogger(__name__)
+    if remote_agent_dir:
+        yaml_path = remote_agent_dir / "instance.yaml"
+        if yaml_path.is_file():
+            ic = InstanceConfig.from_yaml(yaml_path)
+            logger.info(
+                "Loaded instance.yaml: workflow=%s, source=%s, envs=%s",
+                ic.workflow,
+                ic.source,
+                ic.envs,
+            )
+            return ic
+
+    ic = InstanceConfig.from_env()
+    logger.info("No instance.yaml — env/defaults: workflow=%s, envs=%s", ic.workflow, ic.envs)
+    return ic
+
+
+def resolve_workflow_dir(
+    script_dir: Path,
+    workflow: str,
+    remote_agent_dir: Path | None = None,
+) -> Path:
+    """Resolve workflow directory. './' prefix = relative to remote agent dir."""
+    if workflow.startswith("./"):
+        if remote_agent_dir is None:
+            raise SystemExit(f"Workflow '{workflow}' uses relative path but no remote config available")
+        return remote_agent_dir / workflow[2:]
+    return script_dir / "presets" / "workflows" / workflow
+
+
+def resolve_active_envs(script_dir: Path, instance_config: InstanceConfig) -> list[str]:
+    """Resolve which env presets are active. None = all available."""
+    if instance_config.envs is not None:
+        return list(instance_config.envs)
+    envs_dir = script_dir / "presets" / "envs"
+    if not envs_dir.is_dir():
+        return []
+    return sorted(d.name for d in envs_dir.iterdir() if d.is_dir() and d.name != ".gitkeep")
+
+
+def validate_instance_config(
+    script_dir: Path,
+    instance_config: InstanceConfig,
+    remote_agent_dir: Path | None = None,
+) -> None:
+    """Validate instance config references exist. FATAL on missing workflow, WARNING on missing env."""
+    logger = logging.getLogger(__name__)
+
+    wf_dir = resolve_workflow_dir(script_dir, instance_config.workflow, remote_agent_dir)
+    if not wf_dir.is_dir():
+        logger.error("FATAL: Workflow preset '%s' not found at %s", instance_config.workflow, wf_dir)
+        sys.exit(1)
+
+    presets = script_dir / "presets"
+    if instance_config.envs is not None:
+        for env in instance_config.envs:
+            env_dir = presets / "envs" / env
+            if not env_dir.is_dir():
+                logger.warning("Env preset '%s' not found — skipping", env)
+
+    active = resolve_active_envs(script_dir, instance_config)
+    for env_name in active:
+        manifest_path = presets / "envs" / env_name / "manifest.yaml"
+        if not manifest_path.is_file():
+            continue
+        with open(manifest_path) as f:
+            manifest = yaml.safe_load(f) or {}
+        requires = manifest.get("requires", {})
+        for var in requires.get("env_vars", []):
+            if not os.environ.get(var):
+                logger.warning("Env preset '%s' requires '%s' (not set)", env_name, var)
+
+    logger.info("Instance config validated: workflow=%s, envs=%s", instance_config.workflow, active)
 
 
 def load_config(script_dir: Path) -> Config:
@@ -24,8 +146,10 @@ def load_config(script_dir: Path) -> Config:
         model=raw["claude"]["model"],
         max_turns=raw["claude"]["maxTurns"],
         interval=raw["polling"]["intervalSeconds"],
-        idle_interval=raw["polling"].get("idleIntervalSeconds", 3600),
+        idle_interval=raw["polling"].get("idleIntervalSeconds", 300),
+        cycle_timeout=raw["claude"].get("cycleTimeoutSeconds", 1800),
         board_key=raw["jira"]["boardKey"],
+        idle_reminder_cooldown_seconds=raw["polling"].get("idleReminderCooldownSeconds", _DEFAULT_COOLDOWN_SECONDS),
     )
 
 
@@ -46,6 +170,14 @@ def load_mcp_servers(script_dir: Path) -> dict:
             data = json.load(f)
         for name, cfg in data.get("mcpServers", {}).items():
             servers[name] = _resolve_env_vars(cfg)
+
+    merged_mcp = script_dir / "data" / "merged-mcp.json"
+    if merged_mcp.exists():
+        with open(merged_mcp) as f:
+            data = json.load(f)
+        for name, cfg in data.get("mcpServers", {}).items():
+            if name not in servers:
+                servers[name] = _resolve_env_vars(cfg)
 
     for mcp_file in sorted(script_dir.glob("personas/*/mcp.json")):
         with open(mcp_file) as f:
@@ -74,35 +206,116 @@ def _resolve_env_vars(obj):
     return obj
 
 
+def load_manifest(
+    script_dir: Path,
+    workflow: str,
+    remote_agent_dir: Path | None = None,
+) -> dict | None:
+    """Load manifest.yaml for a workflow preset. Returns None if not found."""
+    path = resolve_workflow_dir(script_dir, workflow, remote_agent_dir) / "manifest.yaml"
+    if not path.is_file():
+        return None
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+
+def validate_manifest(
+    script_dir: Path,
+    workflow: str,
+    mcp_servers: dict,
+    remote_agent_dir: Path | None = None,
+) -> None:
+    """Validate workflow manifest requirements at startup.
+
+    FATAL (sys.exit) on missing required MCP servers or env vars.
+    WARNING on missing optional env vars or absent manifest.
+    """
+    logger = logging.getLogger(__name__)
+    manifest = load_manifest(script_dir, workflow, remote_agent_dir)
+    if manifest is None:
+        logger.warning("No manifest.yaml for workflow '%s' — skipping validation", workflow)
+        return
+
+    requires = manifest.get("requires", {})
+    errors: list[str] = []
+
+    # Collect all available MCP server names: bot/mcp.json + merged + persona
+    # servers are in `mcp_servers`; root .mcp.json (SDK-loaded) checked separately.
+    available_servers = set(mcp_servers.keys())
+    root_mcp = script_dir / ".mcp.json"
+    if root_mcp.is_file():
+        with open(root_mcp) as f:
+            root_data = json.load(f)
+        available_servers.update(root_data.get("mcpServers", {}).keys())
+
+    for server in requires.get("mcp_servers", []):
+        if server not in available_servers:
+            errors.append(f"Required MCP server '{server}' not configured")
+
+    for var in requires.get("env_vars", []):
+        if not os.environ.get(var):
+            errors.append(f"Required env var '{var}' not set")
+
+    if errors:
+        for err in errors:
+            logger.error("FATAL: %s", err)
+        logger.error(
+            "Workflow '%s' manifest validation failed — %d error(s). Check deployment config.",
+            workflow,
+            len(errors),
+        )
+        sys.exit(1)
+
+    for var in requires.get("optional_env_vars", []):
+        if not os.environ.get(var):
+            logger.warning("Optional env var '%s' not set", var)
+
+    logger.info("Manifest validation passed for workflow '%s'", workflow)
+
+
 # Env vars that contain secrets and must be removed before starting
 # the agent. MCP servers get resolved values; gh/glab use config files.
 SECRET_ENV_VARS = [
-    "JIRA_API_TOKEN",
     "GH_TOKEN",
     "GITHUB_TOKEN",
     "GITLAB_TOKEN",
-    "SSH_PRIVATE_KEY_B64",
     "GPG_PRIVATE_KEY_B64",
-    "GOOGLE_SA_KEY_B64",
-    "BOT_SSH_KEY",
-    "GITLAB_SSH_KEY",
     "GPG_SIGNING_KEY",
+    "SSO_USERNAME",
+    "SSO_PASSWORD",
+]
+
+
+# Git env vars that override gitconfig — must be removed so
+# includeIf per-platform identity works correctly.
+GIT_OVERRIDE_VARS = [
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
 ]
 
 
 def sanitize_env() -> None:
-    """Remove secret env vars so Bash subprocesses can't leak them.
+    """Remove secret and git-override env vars before starting the agent.
 
     Call this AFTER load_mcp_servers() (which resolves ${VAR} references)
     and after gh/glab auth setup (which writes tokens to config files).
     """
-    for var in SECRET_ENV_VARS:
+    for var in SECRET_ENV_VARS + GIT_OVERRIDE_VARS:
         os.environ.pop(var, None)
 
 
 ALLOWED_TOOLS = [
     # Built-in tools
-    "Edit", "Write", "Read", "Glob", "Grep", "Bash", "LSP",
+    "Edit",
+    "Write",
+    "Read",
+    "Glob",
+    "Grep",
+    "Bash",
+    "LSP",
+    "Skill",
     # Jira MCP tools
     "mcp__mcp-atlassian__jira_search",
     "mcp__mcp-atlassian__jira_get_issue",

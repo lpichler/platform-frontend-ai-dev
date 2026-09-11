@@ -11,12 +11,32 @@ from typing import TYPE_CHECKING
 
 import httpx
 
+from .constants import MEMORY_API_BASE
+
 if TYPE_CHECKING:
     from .agent import CycleContext
 
 logger = logging.getLogger(__name__)
 
-COSTS_API = os.environ.get("COSTS_API_URL", "http://localhost:8080/api/costs")
+COSTS_API = os.environ.get("COSTS_API_URL", f"{MEMORY_API_BASE}/costs")
+
+
+_NO_WORK_PATTERNS = [
+    "NO_WORK_FOUND",
+    "no work found",
+    "no work available",
+    "nothing to do",
+    "nothing to pick up",
+    "no tickets",
+    "no unassigned",
+    "no assigned tickets",
+    "0 unassigned",
+]
+
+
+def _is_no_work(text: str) -> bool:
+    lower = text.lower()
+    return any(p.lower() in lower for p in _NO_WORK_PATTERNS)
 
 
 def _build_entry(label: str, result, ctx: CycleContext | None = None) -> dict:
@@ -41,12 +61,13 @@ def _build_entry(label: str, result, ctx: CycleContext | None = None) -> dict:
         "cache_read_tokens": usage.get("cache_read_input_tokens", 0),
         "cache_write_tokens": usage.get("cache_creation_input_tokens", 0),
         "model": model,
+        "model_usage": model_usage if model_usage else {},
         "is_error": getattr(result, "subtype", "") != "success",
-        "no_work": "NO_WORK_FOUND" in result_text,
+        "no_work": _is_no_work(result_text),
     }
 
     if ctx:
-        entry["jira_key"] = ctx.jira_key
+        entry["external_key"] = ctx.jira_key
         entry["repo"] = ctx.repo
         entry["work_type"] = ctx.work_type
         entry["summary"] = ctx.summary
@@ -68,8 +89,16 @@ def record_cost(costs_file: Path, label: str, result, ctx: CycleContext | None =
 
     # Push to dashboard API
     try:
-        httpx.post(COSTS_API, json=entry, timeout=3.0)
-    except Exception:
-        logger.debug("Failed to push cost to dashboard API (dashboard may be down)")
+        resp = httpx.post(COSTS_API, json=entry, timeout=3.0)
+        if not resp.is_success:
+            logger.warning(
+                "Cost push failed: HTTP %d: %s",
+                resp.status_code,
+                resp.text[:200],
+            )
+    except httpx.TimeoutException:
+        logger.warning("Cost push timed out after 3s")
+    except Exception as e:
+        logger.warning("Cost push failed: %s", e)
 
     return entry["no_work"]

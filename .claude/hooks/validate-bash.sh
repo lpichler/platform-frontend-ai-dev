@@ -27,10 +27,22 @@ if [[ -z "$COMMAND" ]]; then
   exit 0
 fi
 
+# --- SHELL WRAPPING / EVAL ---
+# Block eval, bash -c, sh -c — these can wrap blocked commands to bypass detection.
+# Only exception: eval "$(use-go ...)" for Go version switching.
+if echo "$COMMAND" | grep -qiE '\beval\b' && ! echo "$COMMAND" | grep -qP '^\s*eval\s+"\$\(use-go\s+[\d.]+\)"$'; then
+  deny "eval is blocked except for 'eval \"\$(use-go <version>)\"'."
+fi
+if echo "$COMMAND" | grep -qiE '(^|[\|;`&(]|\$\()\s*(bash|sh|zsh|dash|ksh)\s+-c\b'; then
+  deny "Shell -c wrappers are blocked — they can bypass command filtering."
+fi
+
 # --- NETWORK EXFILTRATION ---
 # Block all network client tools. The bot should only make HTTP requests
 # via MCP tools (mcp-atlassian, chrome-devtools, bot-memory).
-if echo "$COMMAND" | grep -qiE '(^|[\|;`&(]|\$\()\s*(curl|wget|nc|ncat|netcat|socat|telnet|lynx|w3m|httpie|http)\b'; then
+# Match anywhere in the command — not just at word boundaries with specific prefixes.
+# This catches: eval "curl ...", bash -c "curl ...", `curl ...`, $cmd=curl; $cmd, etc.
+if echo "$COMMAND" | grep -qiE '\b(curl|wget|nc|ncat|netcat|socat|telnet|lynx|w3m|httpie)\b'; then
   deny "Network client commands (curl/wget/nc/etc.) are blocked. Use MCP tools for HTTP requests."
 fi
 
@@ -51,12 +63,30 @@ if echo "$COMMAND" | grep -qiE '(^|[\|;`&(]|\$\()\s*env\s*$'; then
   deny "env (without arguments) is blocked — environment may contain secrets."
 fi
 # Block reading known credential files
-if echo "$COMMAND" | grep -qiE '(cat|less|more|head|tail|bat|strings|xxd|od|hexdump)\s+.*(\.\benv\b|sa-key\.json|\.ssh/|\.gnupg/|\.aws/|\.kube/config|\.npmrc|\.pypirc)'; then
+if echo "$COMMAND" | grep -qiE '(cat|less|more|head|tail|bat|strings|xxd|od|hexdump|grep|awk|sed)\s+.*(\.\benv\b|sa-key\.json|\.ssh/|\.gnupg/|\.aws/|\.kube/config|\.npmrc|\.pypirc|\.config/gh/)'; then
   deny "Reading credential/secret files is blocked."
+fi
+# Block python open() on credential files
+if echo "$COMMAND" | grep -qiE 'python[23]?\s+.*-c\s+.*open\s*\(.*(\.\benv\b|sa-key\.json|\.ssh/|\.gnupg/|\.config/gh/|\.aws/)'; then
+  deny "Python file read of credential files is blocked."
 fi
 # Block echo/printf of secret env vars
 if echo "$COMMAND" | grep -qiE '(echo|printf)\s+.*\$\{?(JIRA_API_TOKEN|SSH_PRIVATE_KEY|GPG_PRIVATE_KEY|GH_TOKEN|GOOGLE_SA_KEY|ANTHROPIC_API_KEY)'; then
   deny "Echoing secret environment variables is blocked."
+fi
+# Block gh auth commands that expose the PAT or require interactive login
+if echo "$COMMAND" | grep -qiE 'gh\s+auth\s+(token|status\s+.*(--show-token|-t)|refresh|login)'; then
+  deny "gh auth token/refresh/login/status-show-token is blocked."
+fi
+# Block standalone gh auth git-credential — token leaks via stdout.
+# Git calls it internally via credential.helper config (not via Bash), so
+# blocking it here only prevents the bot from invoking it directly.
+if echo "$COMMAND" | grep -qiE 'gh\s+auth\s+git-credential'; then
+  deny "gh auth git-credential is blocked — git handles credentials automatically via the global credential helper."
+fi
+# Block standalone glab credential-helper — same token leak risk as gh auth git-credential.
+if echo "$COMMAND" | grep -qiE 'glab\s+credential-helper'; then
+  deny "glab credential-helper is blocked — git handles credentials automatically via the global credential helper."
 fi
 
 # --- DESTRUCTIVE OPERATIONS ---

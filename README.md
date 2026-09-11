@@ -2,6 +2,19 @@
 
 An autonomous developer agent that picks groomed Jira tickets, implements them, opens PRs, and maintains them through review — all without human intervention. It runs in a polling loop using the Claude Agent SDK (Python) and integrates with Jira, GitHub/GitLab, and a persistent memory system.
 
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [Architecture](ARCHITECTURE.md) | System design, credential isolation, component overview |
+| [Setup](SETUP.md) | Local development setup and configuration |
+| [Operations](OPERATIONS.md) | Production operations, monitoring, troubleshooting |
+| [Onboarding a New Instance](docs/onboarding-new-instance.md) | Step-by-step guide for adding a new bot instance |
+| [Presets](docs/presets/README.md) | Preset system — env presets (node, go, browser...) and workflow presets |
+| [Custom Workflows](docs/presets/custom-workflows.md) | Guide to building custom workflows for your instance |
+| [Custom Preflight Scripts](docs/presets/custom-preflight.md) | Guide to writing pre-session data-gathering scripts |
+| [Scheduling](docs/scheduling.md) | KEDA cron scaling for bot instances (business hours only) |
+
 ## Prerequisites
 
 Before setting up the bot, make sure you have the following installed:
@@ -10,14 +23,13 @@ Before setting up the bot, make sure you have the following installed:
 |------------|---------|---------|
 | [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | Agent runtime (bundled with the SDK) | `npm install -g @anthropic-ai/claude-code` |
 | [uv](https://docs.astral.sh/uv/) | Python package manager | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
-| [Docker](https://docs.docker.com/get-docker/) + Docker Compose | Memory server, target repo dev environments | Install Docker Desktop |
+| [Podman](https://podman.io/) or Docker | Memory server, target repo dev environments | `brew install podman` or install Docker |
 | [Node.js](https://nodejs.org/) + npm | TypeScript LSP server | `brew install node` or via nvm |
 | [jq](https://jqlang.github.io/jq/) | JSON processing | `brew install jq` |
-| [gh](https://cli.github.com/) | GitHub CLI | `brew install gh` then `gh auth login` (use SSH protocol) |
-| [glab](https://gitlab.com/gitlab-org/cli) | GitLab CLI (only for GitLab repos) | `brew install glab` then `glab auth login` (use SSH protocol) |
-| SSH keys | Git access to target repos | Must be configured for GitHub and/or GitLab |
+| [gh](https://cli.github.com/) | GitHub CLI | `brew install gh` then `gh auth login` |
+| [glab](https://gitlab.com/gitlab-org/cli) | GitLab CLI (only for GitLab repos) | `brew install glab` then `glab auth login --hostname gitlab.cee.redhat.com` |
 
-The bot also uses the [mcp-atlassian](https://github.com/sooperset/mcp-atlassian) MCP server for Jira integration (configured in `.mcp.json`).
+The bot also uses the [mcp-atlassian](https://github.com/sooperset/mcp-atlassian) MCP server for Jira integration — it runs inside the proxy container (see [Architecture](#architecture-credential-isolation)).
 
 ### Authentication
 
@@ -33,6 +45,8 @@ JIRA_API_TOKEN=your-jira-api-token
 # Claude — GCP Vertex AI (service account)
 # Follow the RH internal guide to set up Vertex AI access
 # and generate a service account key file (sa-key.json).
+GOOGLE_SA_KEY_B64=$(base64 < sa-key.json)
+VERTEX_ALLOWED_MODELS=claude-sonnet-4-6,claude-opus-4-6,claude-haiku-4-5
 
 # GitHub — bot PAT for gh CLI
 GH_TOKEN=ghp_...
@@ -69,8 +83,6 @@ make stop              # Stop a running bot (release lock)
 make logs              # Tail bot log
 make memory-server     # Start memory server + postgres (standalone)
 make memory-server-stop # Stop standalone memory server
-make docker-up         # Start full stack in Docker (postgres + memory server + bot)
-make docker-down       # Stop full stack
 make dashboard         # Build the dashboard UI
 make costs             # Show all cost data
 make costs-today       # Show today's costs
@@ -112,7 +124,7 @@ Tickets must be explicitly groomed. The bot never picks random backlog items.
 ### Required labels
 
 - **Primary label** (e.g. `hcc-ai-framework`, `hcc-ai-platform-accessmanagement`) — marks the ticket as bot-eligible for a specific team. The bot only picks up tickets with its configured label.
-- **`repo:<name>`** — identifies the target repo (must match a key in `project-repos.json`). A ticket can have multiple `repo:` labels for cross-repo work.
+- **`repo:<name>`** or **`repo:<org>/<name>`** — identifies the target repo. Bare names (e.g. `repo:insights-chrome`) match keys in `project-repos.json` directly. Org-prefixed names (e.g. `repo:RedHatInsights/insights-chrome`) are resolved via the upstream URL. A ticket can have multiple `repo:` labels for cross-repo work.
 
 ### Optional labels
 
@@ -147,15 +159,15 @@ All repos use forks by default. The bot pushes to the fork and opens PRs/MRs tar
    ```bash
    gh repo fork RedHatInsights/my-repo --clone=false
    ```
-2. Add to `project-repos.json`:
+2. Add to the remote config repo's `project-repos.json`:
    ```json
    "my-repo": {
-     "url": "git@github.com:platex-rehor-bot/my-repo.git",
-     "upstream": "git@github.com:RedHatInsights/my-repo.git"
+     "url": "https://github.com/platex-rehor-bot/my-repo.git",
+     "upstream": "https://github.com/RedHatInsights/my-repo.git"
    }
    ```
    For GitLab repos, add `"host": "gitlab"`.
-3. Add a `repo:my-repo` label to the Jira ticket.
+3. Add a `repo:my-repo` label to the Jira ticket. You can also use the full `repo:OrgName/my-repo` format.
 
 The bot clones repos automatically when it picks up a ticket. It fetches from `upstream`, creates branches based on the latest upstream code, pushes to `origin` (the fork), and opens PRs/MRs targeting the upstream repo.
 
@@ -163,62 +175,90 @@ The bot clones repos automatically when it picks up a ticket. It fetches from `u
 
 Personas are NOT hardcoded to repos. The bot dynamically selects the best-fit persona(s) based on the ticket description and the repo's tech stack (e.g. `package.json` → `frontend`, `go.mod` → `backend`/`operator`, Dockerfile-only → `tooling`, config repo → `config`). For CVE tickets, the `cve` persona layers on top of the base persona.
 
+## Remote config
+
+Personas, `project-repos.json`, per-persona MCP servers, and custom skills live in a **remote config repo** rather than being baked into the bot image. This allows updating bot behavior without rebuilding.
+
+At startup, `run.py` clones/pulls the repo specified by `BOT_CONFIG_REPO` and merges its contents using the **merge engine** (`bot/merge.py`):
+
+- Remote personas, project-repos entries, MCP servers, and skills are added to the bot's runtime config
+- Bot-critical settings (security hooks, core skills, sandbox permissions, core MCP servers) are **protected** and cannot be overridden by remote config
+- The merge engine produces a report of what was added, overridden, or protected
+
+Set the repo URL via env var:
+```bash
+BOT_CONFIG_REPO=https://github.com/your-org/your-config-repo
+```
+
+The config repo should contain an `agent/` directory with:
+```
+agent/
+  project-repos.json   # Repo label → git URL mapping
+  personas/            # Per-repo-type guidelines (frontend/, backend/, etc.)
+  mcp.json             # Additional MCP servers
+  skills/              # Custom skills
+```
+
+## Running as a runner instance (Dockerfile.runner)
+
+For creating **new bot instances** with custom personas and config, the repo includes `Dockerfile.runner` — a full build template designed for use via git submodule.
+
+Runner repos add dev-bot as a submodule and build from `Dockerfile.runner`, which provides two extension points:
+
+- **`setup.sh`** (required) — custom build steps (install packages, write config, etc.)
+- **`instance/`** (optional) — extra files COPYed to `/home/botuser/app/instance/`
+
+### Setting up a runner repo
+
+```bash
+# 1. Create your runner repo
+mkdir my-bot-instance && cd my-bot-instance
+git init
+
+# 2. Add dev-bot as a submodule
+git submodule add https://github.com/RedHatInsights/platform-frontend-ai-dev.git dev-bot
+
+# 3. Create setup.sh (required)
+cat > setup.sh << 'EOF'
+#!/bin/bash
+set -e
+echo "my-bot-instance" > /home/botuser/app/.instance-id
+# Add custom build steps here (dnf install, config, etc.)
+EOF
+
+# 4. Create instance/ directory (optional)
+mkdir -p instance
+
+# 5. Build
+docker build -f dev-bot/Dockerfile.runner -t my-bot-instance:local .
+```
+
+To update to the latest dev-bot: `git submodule update --remote dev-bot`
+
 ## Running the services
 
-### Option A: Bot on host, memory server in Docker (recommended)
+### Option A: OpenShift (recommended)
 
-The recommended setup for development. The bot runs directly on your machine while the memory server runs in Docker.
+The production deployment. Bot, proxy, and memory server run as separate pods with full credential isolation and network policies. See `deploy/template.yaml` and `OPERATIONS.md` for details.
 
-#### 1. Configure `.env`
+### Option B: Bot on host (advanced)
 
-Copy `.env.example` to `.env` and fill in your credentials. All identity and auth settings are driven by `.env` — at startup, `run.py` reads these and auto-configures git and SSH.
-
-**Git identity** — set `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`, `GIT_COMMITTER_EMAIL` to commit as the bot account. If unset, your local git config is used.
-
-**GPG signing** — import the bot's GPG key (`gpg --import <key-file>`), then set `GPG_SIGNING_KEY` to the key ID. If unset, commits are not signed.
-
-**SSH keys** — set `BOT_SSH_KEY` and/or `GITLAB_SSH_KEY` to route git traffic through specific keys per host. Paths can be absolute or relative to the repo root. If unset, your default SSH agent is used.
-
-**CLI auth** — set `GH_TOKEN` and/or `GITLAB_TOKEN`, or log in manually:
-```bash
-gh auth login                                       # GitHub
-glab auth login --hostname gitlab.cee.redhat.com    # GitLab
-```
-
-#### 2. Start the services
+Running the bot directly on your machine bypasses the security harness (proxy-based credential isolation, Squid allowlist, bash hooks enforcement). This mode requires manual setup of git identity, GPG signing, and CLI auth, and is not recommended for production use.
 
 ```bash
-# Start memory server + postgres
+# 1. Configure .env with credentials (see Authentication above)
+cp .env.example .env
+
+# 2. Start memory server + postgres
 make memory-server
 
-# Run bot on host (uses localhost:8080 for memory server)
+# 3. Run bot on host (uses localhost:8080 for memory server)
 make run LABEL=hcc-ai-framework
-```
-
-### Option B: Full stack in Docker
-
-For production-like deployments or CI — everything runs in containers with dedicated bot credentials:
-
-```bash
-# Set secrets (or add to .env — see SOP.md for details)
-export SSH_PRIVATE_KEY_B64=$(base64 -i .ssh/id_ed25519)
-export GPG_PRIVATE_KEY_B64=$(base64 -i .ssh/gpg-private.asc)
-export GH_TOKEN=<your-pat>
-export GOOGLE_SA_KEY_B64=$(base64 -i sa-key.json)
-
-# Start everything
-make docker-up
-
-# Override the bot label
-BOT_LABEL=hcc-ai-platform-accessmanagement make docker-up
-
-# Stop
-make docker-down
 ```
 
 ### Memory server + dashboard
 
-The memory server runs as Docker containers (PostgreSQL with pgvector + Python app). `make init` starts it automatically.
+The memory server runs as containers (PostgreSQL with pgvector + Python app). `make init` starts it automatically.
 
 ```bash
 make memory-server              # Start
@@ -254,21 +294,38 @@ This launches Chrome on port 9222 with a separate profile. Edit the script to us
 }
 ```
 
-MCP servers are configured in `.mcp.json` (project-level) and `personas/*/mcp.json` (per-persona tools).
+MCP servers are configured in `.mcp.json` (project-level). Remote config repos can provide additional MCP servers via `agent/mcp.json`.
 
 ## Personas
 
-Each repo has one or more personas that provide domain-specific guidelines. Personas live in `personas/<type>/prompt.md`:
+Personas provide domain-specific guidelines for different repo types. They live in the remote config repo under `agent/personas/<type>/prompt.md`:
 
 | Persona | Scope |
 |---------|-------|
 | `frontend` | React/TypeScript/PatternFly repos. Visual verification, `npm run lint/test`. |
 | `backend` | Go and Node.js backend services. |
-| `rbac` | Django/DRF RBAC service (insights-rbac). Docker Compose dev env, `make unittest-fast`. |
+| `rbac` | Django/DRF RBAC service (insights-rbac). Container-based dev env, `make unittest-fast`. |
 | `operator` | Kubernetes operators (Go). |
 | `config` | Config repos (app-interface). Read-only or GitLab MR workflow. |
 | `cve` | CVE remediation — dependency upgrades, base image updates, security scanning. |
 | `tooling` | Build/dev infrastructure — Dockerfiles, shell scripts, proxy configs. |
+| `rds-upgrade` | RDS blue-green upgrades in app-interface. Layers on `config`. |
+
+## Skills
+
+The bot has built-in skills (Claude Code slash commands) in `.claude/skills/`:
+
+| Skill | Purpose |
+|-------|---------|
+| `triage` | Pre-gathers all active task statuses, PR/MR states, CI, reviews, Jira comments |
+| `new-work` | Fetches unassigned sprint candidates with full context |
+| `claim-ticket` | Claims a Jira ticket (assign, transition, sprint) |
+| `push-and-pr` | Pushes branch and creates PR/MR via API |
+| `post-pr` | Post-PR actions (Jira transition, comments, linked issues) |
+| `wrap-up` | Handles PR merge cleanup (archival, Jira transition, Slack, branch deletion) |
+| `slack-notify` | Sends Slack notifications with 48h per-ticket cooldown |
+| `auto-fork` | Forks repos under the bot's GitHub account |
+| `gh-release-upload` | Uploads screenshots to GitHub releases for PR comments |
 
 ## Memory system
 
@@ -306,8 +363,77 @@ make costs-week      # Last 7 days
 ./costs.sh backfill     # Import from bot.log
 ```
 
-The dashboard at http://localhost:8080 also shows cost charts with per-cycle breakdowns by work type.
+The dashboard at http://localhost:8080 shows cost breakdowns, per-cycle metrics, task status, memory search, and a 3D embedding visualization.
 
+## Architecture: Credential Isolation
+
+The bot uses a **defense-in-depth** model to prevent credential leakage. Secrets never enter the bot container — all credential-bearing operations are proxied through a separate **proxy container**.
+
+```mermaid
+graph LR
+    subgraph Bot["Bot Container"]
+        SDK["Claude Agent SDK"]
+        ThinGH["thin client: gh"]
+        ThinGLAB["thin client: glab"]
+        ThinGPG["thin client: gpg"]
+        GitPush["git push<br/>(credential helper)"]
+        VertexReq["Vertex AI requests"]
+    end
+
+    subgraph Proxy["Proxy Container"]
+        Squid["Squid<br/>(port 3128)<br/>domain allowlist"]
+        Exec["executor-server<br/>(gRPC)<br/>policy allowlist"]
+        VertexAuth["Vertex Auth Proxy<br/>(port 8443)<br/>OAuth2 token injection"]
+        JiraMCP["mcp-atlassian<br/>(port 8444)<br/>Jira API"]
+        Bins["gh-real / glab-real<br/>gpg (with keys)"]
+    end
+
+    ThinGH -- "gRPC" --> Exec
+    ThinGLAB -- "gRPC" --> Exec
+    ThinGPG -- "gRPC" --> Exec
+    GitPush -- "gRPC" --> Exec
+    Exec --> Bins
+    VertexReq -- "HTTP :8443" --> VertexAuth
+    SDK -- "HTTP :8444" --> JiraMCP
+    SDK -- "HTTP_PROXY :3128" --> Squid
+
+    VertexAuth -- "HTTPS + Bearer" --> VertexAPI["Vertex AI"]
+    Squid --> Internet["GitHub / GitLab<br/>npm / etc."]
+```
+
+### How it works
+
+- **CLI tools** (`gh`, `glab`, `gpg`) in the bot container are **thin client shims** — a single Go binary (hardlinked as `gh`, `glab`, `gpg`) that detects the tool name from `argv[0]` and forwards commands over gRPC to the proxy's executor server.
+- The **executor server** validates commands against a built-in **policy allowlist** (e.g. `gh pr create` is allowed, `gh auth token` is blocked), then executes the real CLI binary with full credentials.
+- **Git credential helpers** are configured globally so `git push` transparently authenticates via the thin client → proxy path.
+- **GPG commit signing** works the same way — git invokes `gpg --sign` which routes through the thin client to the proxy's GPG keyring.
+- **Vertex AI auth proxy** (port 8443) — the bot sends unauthenticated requests to the proxy's embedded HTTP server. The proxy injects OAuth2 Bearer tokens from the GCP service account, rewrites dummy project/region values to real ones, enforces a model allowlist, and forwards to the Vertex AI API. The bot never sees the SA key or tokens.
+- **Jira MCP server** (port 8444) — mcp-atlassian runs inside the proxy container with the Jira API token. The bot connects via streamable HTTP transport — no Jira credentials in the bot container.
+- **HTTP/HTTPS traffic** is routed through Squid with a domain allowlist — the bot container has no direct internet access.
+- **Bash hooks** (`.claude/hooks/validate-bash.sh`) block dangerous commands (curl, eval, credential reads) as an additional defense layer.
+
+### What lives where
+
+| Component | Bot Container | Proxy Container |
+|-----------|:---:|:---:|
+| GH_TOKEN / GITLAB_TOKEN | - | yes |
+| GPG private key | - | yes |
+| GCP service account key | - | yes |
+| Jira API token | - | yes |
+| gh / glab CLIs (real) | - | yes |
+| gh / glab / gpg (thin client) | yes | - |
+| Squid proxy | - | yes |
+| Vertex AI auth proxy | - | yes |
+| mcp-atlassian (Jira MCP) | - | yes |
+| Agent SDK + bot code | yes | - |
+
+### Dev proxy (local UI verification)
+
+The `dev-proxy/` directory contains a custom Caddy build for local UI verification against stage environments. The bot starts it when it needs to verify frontend changes against a running HCC stage deployment.
+
+### Deployment
+
+- **OpenShift**: Bot and proxy run as separate pods connected via ClusterIP Service. A `NetworkPolicy` restricts bot egress to the proxy and memory-server pods only.
 ## Project structure
 
 ```
@@ -315,36 +441,57 @@ dev-bot/
   pyproject.toml         # Python project config (uv workspace root)
   Makefile               # Common commands
   bot/                   # Agent runner (Python package)
-    run.py               # Main loop entry point
+    run.py               # Main loop + remote config sync
     agent.py             # SDK query invocation per cycle
     config.py            # Config loading + MCP server merging
     costs.py             # Cost tracking
+    merge.py             # Remote config merge engine (protected-key registry)
   config.json            # Model, polling intervals, Jira config
-  project-repos.json     # Repo label -> git URL + persona mapping
   CLAUDE.md              # Full agent instructions (the bot's brain)
   .mcp.json              # MCP server connections (Jira, memory, browser)
   .env                   # Credentials (not committed)
+  Dockerfile             # Bot container image
+  Dockerfile.runner      # Runner instance template (used via git submodule)
+  docker-compose.yml     # Full stack: bot + proxy + memory server + postgres
+  entrypoint.sh          # Container entrypoint (remote config sync + bot start)
   init.sh                # Installs LSP, downloads BrowserMCP, starts memory server
   costs.sh               # Cost report CLI
   start-chromium.sh      # Launch Chrome with remote debugging
+  .claude/               # Claude Code config
+    settings.json        # Permissions + sandbox config
+    hooks/               # Bash validation hooks (security)
+    skills/              # Built-in skills (triage, claim-ticket, push-and-pr, etc.)
+  proxy/                 # Credential-bearing proxy (Squid + executor + Vertex auth + Jira MCP)
+    Dockerfile           # Squid + gh-real/glab-real + executor + mcp-atlassian
+    squid.conf           # Domain allowlist
+    start.sh             # Process manager (Squid + executor-server + mcp-atlassian)
+    executor/            # gRPC executor + Vertex auth proxy (Go)
+      proto/             # Protobuf service definition
+      gen/               # Generated gRPC code
+      cmd/server/        # Executor server binary (gRPC + HTTP)
+      cmd/client/        # Thin client binary (hardlinked as gh/glab/gpg)
+      policy.go          # CLI command allowlist engine
+      vertex.go          # Vertex AI reverse proxy (URL rewrite + token injection)
+      vertex_policy.go   # Vertex AI model allowlist engine
+  dev-proxy/             # Custom Caddy for local UI verification against stage
+    Caddyfile            # Reverse proxy config
+    main.go              # Caddy with custom modules
+    start-proxy.sh       # Start script
   memory-server/         # Persistent memory + task tracking
-    src/
+    bot_memory_server/   # Python package
       server.py          # FastMCP + Starlette + WebSocket
-      tools/             # MCP tools (task_*, memory_*)
+      tools/             # MCP tools (task_*, memory_*, slack_notify, cycles)
       api.py             # REST API for the dashboard
+      artifacts.py       # PR/artifact tracking
+      migrations/        # Database migrations (zero-downtime)
       static/            # Dashboard UI (React + Vite, built assets)
     docker-compose.yml   # PostgreSQL (pgvector) + memory server
-  personas/              # Per-repo-type guidelines
-    frontend/            # React/TS/PatternFly + PatternFly MCP
-    backend/             # Go/Node backend
-    rbac/                # Django/DRF RBAC service
-    operator/            # Kubernetes operator
-    config/              # Config repo
-    cve/                 # CVE remediation
   prompts/               # Interactive prompts (grooming, etc.)
   dashboard/             # Dashboard source (React + Vite + TypeScript)
-  repos/                 # Cloned target repos (created on demand)
+  deploy/                # OpenShift deployment template
+  tests/                 # Bot unit tests (merge engine, etc.)
   scripts/               # Utility scripts
+  repos/                 # Cloned target repos (created on demand, gitignored)
 ```
 
 ## Example

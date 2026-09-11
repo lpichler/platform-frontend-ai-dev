@@ -18,14 +18,25 @@ WORKDIR /app
 COPY memory-server/pyproject.toml memory-server/uv.lock* ./
 RUN uv sync --frozen --no-dev --no-install-project
 
-COPY memory-server/src/ src/
+COPY memory-server/bot_memory_server/ bot_memory_server/
 
 # Copy dashboard build output into static dir
-COPY --from=dashboard /app/memory-server/src/static/index.html src/static/index.html
-COPY --from=dashboard /app/memory-server/src/static/assets/ src/static/assets/
+COPY --from=dashboard /app/memory-server/bot_memory_server/static/index.html bot_memory_server/static/index.html
+COPY --from=dashboard /app/memory-server/bot_memory_server/static/assets/ bot_memory_server/static/assets/
 
 RUN uv sync --frozen --no-dev
 
+# Pre-download the embedding model so startup doesn't need HuggingFace
+RUN uv run python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')" \
+    && rm -rf /opt/app-root/src/.cache/uv \
+    && chmod -R a+rX /opt/app-root/src/.cache/huggingface
+
+# Offline mode — model is baked in, no network/cache writes needed at runtime
+ENV HF_HUB_OFFLINE=1
+
 EXPOSE 8080
 
-CMD ["uv", "run", "python", "-m", "src.server"]
+# Run python directly from the pre-built venv — avoids uv cache init permission
+# issues with OpenShift arbitrary UIDs (astral-sh/uv#10023)
+ENV PATH="/app/.venv/bin:$PATH"
+CMD ["python", "-m", "bot_memory_server.server"]

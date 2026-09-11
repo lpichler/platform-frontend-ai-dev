@@ -3,8 +3,13 @@ import react from '@vitejs/plugin-react'
 
 export default defineConfig({
   plugins: [react()],
+  test: {
+    environment: 'jsdom',
+    globals: true,
+    setupFiles: ['./src/test/setup.ts'],
+  },
   build: {
-    outDir: '../memory-server/src/static',
+    outDir: '../memory-server/bot_memory_server/static',
     emptyOutDir: false,
   },
   server: {

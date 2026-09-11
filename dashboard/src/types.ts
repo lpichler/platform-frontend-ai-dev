@@ -1,24 +1,34 @@
+export interface SlackNotification {
+  event_type: string;
+  message: string;
+  sent_at: string;
+}
+
 export interface Task {
   id: number;
-  jira_key: string;
-  status: 'in_progress' | 'pr_open' | 'pr_changes' | 'paused' | 'done';
+  external_key: string;
+  source_type: string;
+  source_url: string | null;
+  artifacts: Array<{ name: string; url: string; type: string }>;
+  status: 'in_progress' | 'pr_open' | 'pr_changes' | 'paused' | 'done' | 'archived';
   repo: string;
   branch: string;
-  pr_number: number | null;
-  pr_url: string | null;
   title: string | null;
   summary: string | null;
   created_at: string;
   last_addressed: string;
   paused_reason: string | null;
+  instance_id: string | null;
   metadata: Record<string, any>;
+  slack_notification?: SlackNotification;
 }
 
 export interface Memory {
   id: number;
   category: string;
   repo: string;
-  jira_key: string | null;
+  external_key: string | null;
+  source_type: string | null;
   title: string;
   content: string;
   tags: string[];
@@ -27,11 +37,28 @@ export interface Memory {
   similarity?: number;
 }
 
+export interface BotInstance {
+  instance_id: string;
+  state: 'working' | 'idle' | 'error' | 'unknown';
+  message: string;
+  external_key: string | null;
+  source_type: string | null;
+  source_url: string | null;
+  repo: string | null;
+  cycle_start: string | null;
+  updated_at: string;
+  active_tasks: number;
+  max_tasks: number;
+}
+
 export interface BotStatus {
   state: 'working' | 'idle' | 'error' | 'unknown';
   message: string;
-  jira_key: string | null;
+  external_key: string | null;
+  source_type: string | null;
+  source_url: string | null;
   repo: string | null;
+  instance_id: string | null;
   cycle_start: string | null;
   updated_at: string;
 }
@@ -51,7 +78,8 @@ export interface CycleEntry {
   model: string;
   is_error: boolean;
   no_work: boolean;
-  jira_key: string | null;
+  external_key: string | null;
+  source_type: string | null;
   repo: string | null;
   work_type: string | null;
   summary: string | null;
@@ -81,6 +109,35 @@ export interface EmbeddingPoint {
   x: number;
   y: number;
   z: number;
+}
+
+export interface TaskCycleGroup {
+  task_id: number | null;
+  external_key: string | null;
+  title: string | null;
+  task_status: string | null;
+  repo: string | null;
+  cycle_count: number;
+  transcript_count: number;
+  total_tool_calls: number | null;
+  total_tokens: number | null;
+  first_cycle: string | null;
+  last_cycle: string | null;
+}
+
+export interface CycleRun {
+  id: number;
+  task_id: number | null;
+  cycle_type: string;
+  instance_id: string | null;
+  started_at: string;
+  finished_at: string | null;
+  tool_calls: number | null;
+  tokens_used: number | null;
+  progress: Record<string, any>;
+  input_prompt: string | null;
+  created_at: string;
+  has_transcript?: boolean;
 }
 
 export interface WSEvent {
@@ -121,7 +178,7 @@ export interface RepoEntry {
 }
 
 export interface TicketEntry {
-  jira_key: string;
+  external_key: string;
   title: string | null;
   status: string | null;
   repo: string | null;

@@ -20,8 +20,12 @@ services:
       dockerfile: memory-server/Dockerfile
     ports:
       - "8080:8080"
+    env_file:
+      - .env
     environment:
       DATABASE_URL: postgresql://bot:bot@postgres:5432/bot_memory
+      TRUSTED_BOT_ACCOUNTS: "${TRUSTED_BOT_ACCOUNTS:-}"
+      KUBEARCHIVE_TOKEN: "${KUBEARCHIVE_TOKEN:-}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -38,6 +42,23 @@ services:
   proxy:
     build:
       context: ./proxy
+    env_file:
+      - .env
+    environment:
+      - GH_TOKEN
+      - GITLAB_TOKEN
+      - GH_USERNAME
+      - GL_USERNAME
+      - GPG_PRIVATE_KEY_B64
+      - GOOGLE_SA_KEY_B64
+      - GCP_PROJECT_ID=${ANTHROPIC_VERTEX_PROJECT_ID:-}
+      - GCP_REGION=${VERTEX_LOCATION:-us-east5}
+      - VERTEX_ALLOWED_MODELS=${VERTEX_ALLOWED_MODELS:-}
+      - JIRA_URL=${JIRA_URL:-https://redhat.atlassian.net}
+      - JIRA_USERNAME
+      - JIRA_API_TOKEN
+    volumes:
+      - executor-sock:/var/run/devbot
     healthcheck:
       test: ["CMD-SHELL", "squidclient -h 127.0.0.1 -p 3128 mgr:info > /dev/null 2>&1 || exit 1"]
       interval: 5s
@@ -52,29 +73,50 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        GOVERSIONS: "1.24.2 1.25.7"
     security_opt:
       - no-new-privileges
-    mem_limit: 4g
+    shm_size: 512m
+    mem_limit: 8g
     cpus: 4
     pids_limit: 500
     env_file:
       - .env
+    volumes:
+      - executor-sock:/var/run/devbot
     environment:
-      - SSH_PRIVATE_KEY_B64
-      - GPG_PRIVATE_KEY_B64
-      - GH_TOKEN
-      - GOOGLE_SA_KEY_B64
+      - GH_USER_NAME
+      - GH_USER_EMAIL
+      - GL_USER_NAME
+      - GL_USER_EMAIL
+      - SSO_USERNAME
+      - SSO_PASSWORD
       - BOT_LABEL=${BOT_LABEL:-hcc-ai-framework}
-      - BOT_MEMORY_URL=http://memory-server:8080/sse
-      - GOOGLE_APPLICATION_CREDENTIALS=/home/botuser/sa-key.json
+      - BOT_INSTANCE_ID=${BOT_INSTANCE_ID:-}
+      - BOT_CONFIG_REPO=${BOT_CONFIG_REPO:-https://github.com/RedHatInsights/platform-frontend-ai-dev}
+      - BOT_CONFIG_PATH=${BOT_CONFIG_PATH:-rehor-config}
+      - BOT_MEMORY_URL=http://memory-server:8080/mcp
+      - COSTS_API_URL=http://memory-server:8080/api/costs
+      - BOT_DASHBOARD_URL=http://memory-server:8080/api/bot-status
+      - CLAUDE_CODE_SKIP_VERTEX_AUTH=true
+      - ANTHROPIC_VERTEX_BASE_URL=http://proxy:8443
+      - ANTHROPIC_VERTEX_PROJECT_ID=${ANTHROPIC_VERTEX_PROJECT_ID:-dummy-project}
+      - CLOUD_ML_REGION=global
+      # Jira — proxied through proxy container (mcp-atlassian on port 8444)
+      - JIRA_MCP_URL=http://proxy:8444/mcp
+      # GH release upload — proxied through proxy container (port 8446)
+      - GH_RELEASE_UPLOAD_URL=http://proxy:8446/upload
+      # Git auth — proxied through proxy container (port 8447)
+      - GIT_AUTH_PROXY_HOST=proxy
       # Route all HTTP/HTTPS through the Squid proxy
       - HTTP_PROXY=http://proxy:3128
       - HTTPS_PROXY=http://proxy:3128
       - http_proxy=http://proxy:3128
       - https_proxy=http://proxy:3128
       # Internal services bypass the proxy
-      - NO_PROXY=memory-server,postgres,localhost,127.0.0.1
-      - no_proxy=memory-server,postgres,localhost,127.0.0.1
+      - NO_PROXY=memory-server,proxy,postgres,localhost,127.0.0.1,.foo.redhat.com
+      - no_proxy=memory-server,proxy,postgres,localhost,127.0.0.1,.foo.redhat.com
     stdin_open: true
     tty: true
     depends_on:
@@ -82,6 +124,12 @@ services:
         condition: service_healthy
       proxy:
         condition: service_healthy
+    extra_hosts:
+      - "prod.foo.redhat.com:127.0.0.1"
+      - "stage.foo.redhat.com:127.0.0.1"
+      - "qa.foo.redhat.com:127.0.0.1"
+      - "ci.foo.redhat.com:127.0.0.1"
+      - "dev.foo.redhat.com:127.0.0.1"
     networks:
       - internal  # No 'external' network — bot can't reach the internet directly
 
@@ -89,6 +137,12 @@ volumes:
   pgdata:
     name: memory-server_pgdata
     external: true
+  executor-sock:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=1m
 
 networks:
   internal:

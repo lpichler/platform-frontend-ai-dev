@@ -10,7 +10,7 @@ All bot-eligible tickets across teams are tracked via a shared Jira filter:
 
 **Filter ID**: [107017](https://redhat.atlassian.net/issues/?filter=107017)
 
-**JQL**: `project = RHCLOUD AND labels in (hcc-ai-framework, hcc-ai-platform-accessmanagement)`
+**JQL**: `project = RHCLOUD AND labels in (hcc-ai-framework, hcc-ai-platform-accessmanagement, hcc-ai-ui, hcc-ai-integrations)`
 
 This shows all tickets tagged for the bot, regardless of status. Use it to see what the bot is working on, what's queued, and what's done.
 
@@ -27,27 +27,24 @@ The memory server dashboard at `http://localhost:8080` shows:
 
 ```bash
 make logs           # Tail bot.log
-docker compose logs -f bot          # Docker container logs
-docker compose logs -f memory-server  # Memory server logs
+podman compose logs -f bot          # Container logs
+podman compose logs -f memory-server  # Memory server logs
 ```
 
 ## Ticket Lifecycle
 
 A ticket goes through these stages as the bot processes it:
 
-```
- Backlog                    In Progress              Code Review                Done
- ┌──────────┐              ┌──────────────┐          ┌─────────────┐          ┌──────┐
- │ Groomed  │  bot claims  │ Bot working  │  PR open │ Waiting for │  merged  │ Done │
- │ + labeled│ ───────────> │ on branch    │ ───────> │ human review│ ───────> │      │
- │          │              │ bot/<KEY>    │          │             │          │      │
- └──────────┘              └──────────────┘          └─────────────┘          └──────┘
-      │                          │                         │                      │
-      │                          │                         │                      │
-   Human grooms              Bot updates               Bot responds           Bot closes
-   and labels                task metadata             to review              Jira ticket
-   the ticket                in memory server          feedback               + stores
-                                                                              learnings
+```mermaid
+graph LR
+    Backlog["Backlog<br/><br/>Groomed + labeled<br/><i>Human grooms and<br/>labels the ticket</i>"]
+    InProgress["In Progress<br/><br/>Bot working on<br/>branch bot/KEY<br/><i>Bot updates task<br/>metadata in memory</i>"]
+    CodeReview["Code Review<br/><br/>Waiting for<br/>human review<br/><i>Bot responds to<br/>review feedback</i>"]
+    Done["Done<br/><br/><i>Bot closes Jira<br/>ticket + stores<br/>learnings</i>"]
+
+    Backlog -- "bot claims" --> InProgress
+    InProgress -- "PR open" --> CodeReview
+    CodeReview -- "merged" --> Done
 ```
 
 ### Example: RHCLOUD-37254
@@ -236,7 +233,7 @@ Or manually ensure the ticket has:
 
 Required labels:
 - **Primary label** — matches the bot instance: `hcc-ai-framework` or `hcc-ai-platform-accessmanagement`
-- **`repo:<name>`** — must match a key in `project-repos.json` (e.g. `repo:insights-rbac`, `repo:notifications-frontend`)
+- **`repo:<name>`** or **`repo:<org>/<name>`** — must match a key in `project-repos.json` either by bare name (e.g. `repo:insights-rbac`) or org-prefixed name resolved via upstream URL (e.g. `repo:RedHatInsights/insights-rbac`)
 
 Optional:
 - `needs-investigation` — bot investigates and reports findings instead of implementing
@@ -276,18 +273,6 @@ make run LABEL=hcc-ai-framework
 make run-rbac
 ```
 
-### In Docker
-
-```bash
-# Start with default label
-make docker-up
-
-# Start with a different label
-BOT_LABEL=hcc-ai-platform-accessmanagement make docker-up
-```
-
-For multiple labels in Docker simultaneously, you'd run separate compose projects or add multiple bot services to `docker-compose.yml`.
-
 ## Cost Management
 
 Each cycle records its cost. Monitor spending:
@@ -321,5 +306,9 @@ Check the bot logs for which server failed:
 
 Check the task record in the dashboard. Look at `metadata.last_step` and `metadata.notes`. If truly stuck:
 1. Comment on the Jira ticket explaining the blocker
-2. Manually set the task status to `paused` via the dashboard
+2. Open the task in the dashboard and click **Pause Task** (optionally enter a reason)
 3. The bot will skip it and move to other work
+
+When the blocker is resolved, open the paused task and click **Unpause Task**. No SQL or cluster access needed. Unpausing restores `in_progress`, or `pr_open` if the task already has a PR/MR artifact.
+
+Pause/unpause only change memory-server task status — they do not transition Jira.

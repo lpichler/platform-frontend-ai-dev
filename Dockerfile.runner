@@ -1,0 +1,106 @@
+# Runner instance image — built from dev-bot submodule
+#
+# Usage: Runner repos add dev-bot as a git submodule, then configure
+# Konflux with dockerfile: dev-bot/Dockerfile.runner and context: .
+#
+# Extension points:
+#   setup.sh   — (required) custom build steps (dnf install, config, etc.)
+#   instance/  — (optional) extra files, COPYed to /home/botuser/app/instance/
+
+# Build executor thin client (gh/glab shim that forwards via UDS to proxy sidecar)
+FROM registry.access.redhat.com/ubi9/go-toolset:latest@sha256:8d2d83261cbc8854b8c93b1237d7d4aa0069bdb93e2974d980bc7788db56f8f4 AS executor-client-builder
+WORKDIR /build
+COPY dev-bot/proxy/executor/ .
+RUN go mod download \
+    && CGO_ENABLED=0 go build -o /tmp/executor-client ./cmd/client
+
+FROM registry.access.redhat.com/ubi9/ubi:latest
+
+# Core system deps + Python 3.12 (env-specific deps installed via presets)
+RUN dnf install -y --nodocs --allowerasing \
+    python3.12 python3.12-pip python3.12-devel \
+    git \
+    curl \
+    jq \
+    socat \
+    gcc \
+    make \
+    sqlite-devel \
+    && dnf clean all
+
+# Make python3.12 the default
+RUN ln -sf /usr/bin/python3.12 /usr/bin/python3 \
+    && ln -sf /usr/bin/python3.12 /usr/bin/python
+
+# Executor thin client — drop-in gh/glab replacement (forwards to proxy sidecar)
+COPY --from=executor-client-builder /tmp/executor-client /usr/local/bin/executor-client
+RUN ln /usr/local/bin/executor-client /usr/local/bin/gh \
+    && ln /usr/local/bin/executor-client /usr/local/bin/glab \
+    && ln /usr/local/bin/executor-client /usr/local/bin/gpg
+
+# bubblewrap (sandbox runtime for Claude Code)
+RUN dnf install -y --nodocs libcap-devel \
+    && pip3.12 install meson ninja \
+    && git clone --depth 1 --branch v0.11.1 https://github.com/containers/bubblewrap.git /tmp/bwrap \
+    && cd /tmp/bwrap \
+    && meson setup _builddir \
+    && meson compile -C _builddir \
+    && meson install -C _builddir \
+    && cd / && rm -rf /tmp/bwrap \
+    && pip3.12 uninstall -y meson ninja \
+    && dnf clean all
+
+# tini — proper init process that reaps zombie children
+RUN ARCH=$(uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/') \
+    && curl -fsSL -o /usr/local/bin/tini "https://github.com/krallin/tini/releases/download/v0.19.0/tini-${ARCH}" \
+    && chmod +x /usr/local/bin/tini
+
+# uv
+RUN pip3.12 install uv
+
+# Non-root user (Claude Code rejects root)
+RUN useradd -m -s /bin/bash botuser
+WORKDIR /home/botuser/app
+
+# Copy project files and install Python deps (as root so uv is available)
+COPY dev-bot/pyproject.toml dev-bot/uv.lock* ./
+COPY dev-bot/bot/ bot/
+RUN uv sync --frozen --no-dev
+ENV PATH="/home/botuser/app/.venv/bin:/home/botuser/go/bin:$PATH"
+ENV GOPATH="/home/botuser/go"
+ENV CLAUDE_CODE_USE_VERTEX=1
+ENV CLOUD_ML_REGION=global
+
+# Copy bot config files
+COPY dev-bot/config.json dev-bot/CLAUDE.md dev-bot/.mcp.json dev-bot/entrypoint.sh ./
+COPY dev-bot/.claude/ .claude/
+
+# Dev-proxy source (used by dev-proxy preset to build Caddy from source)
+COPY dev-bot/dev-proxy/ dev-proxy/
+
+# Instance files — COPY early so install-envs.sh can read instance.yaml
+COPY instance/ /home/botuser/app/instance/
+
+# Env presets — selective install based on instance.yaml envs list
+COPY dev-bot/presets/ presets/
+RUN bash presets/install-envs.sh
+
+ENV HOME=/home/botuser
+USER botuser
+
+# === INSTANCE CUSTOMIZATION ===
+# Runner repos extend the base image here via setup.sh and instance/ files.
+USER 0
+
+# Run instance-specific build steps
+COPY setup.sh /tmp/instance-setup.sh
+RUN chmod +x /tmp/instance-setup.sh \
+    && bash /tmp/instance-setup.sh \
+    && rm /tmp/instance-setup.sh
+
+# Fix ownership — must run last
+RUN chown -R botuser:0 /home/botuser \
+    && chmod -R g+rwX /home/botuser
+USER botuser
+
+ENTRYPOINT ["tini", "--", "bash", "entrypoint.sh"]

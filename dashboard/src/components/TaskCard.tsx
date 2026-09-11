@@ -1,5 +1,18 @@
 import type { Task } from '../types';
-import { timeAgo, JIRA_BASE } from '../utils';
+import { timeAgo, sourceUrl, displayKey } from '../utils';
+import {
+  Card,
+  CardBody,
+  CardHeader,
+  CardTitle,
+  Flex,
+  FlexItem,
+  Label,
+  LabelGroup,
+  Content,
+  Icon
+} from '@patternfly/react-core';
+import { ExclamationTriangleIcon } from '@patternfly/react-icons';
 
 interface Props {
   task: Task;
@@ -16,55 +29,86 @@ const statusLabels: Record<string, string> = {
   archived: 'Archived',
 };
 
+const statusColors: Record<string, 'blue' | 'green' | 'orange' | 'red' | 'purple' | 'grey'> = {
+  in_progress: 'blue',
+  pr_open: 'green',
+  pr_changes: 'orange',
+  done: 'grey',
+  paused: 'purple',
+  archived: 'grey',
+};
+
 export default function TaskCard({ task, selected, onClick }: Props) {
-  const step = task.metadata?.last_step;
+  const url = sourceUrl(task);
+  const key = displayKey(task);
+  const firstArtifact = task.artifacts?.[0];
 
   return (
-    <div
-      className={`task-card status-${task.status}${selected ? ' selected' : ''}`}
+    <Card
+      isCompact
+      isGlass
+      isSelected={selected}
       onClick={onClick}
+      style={{ cursor: 'pointer', borderLeft: `3px solid ${task.status === 'in_progress' ? 'var(--accent)' : task.status === 'pr_changes' ? 'var(--yellow)' : task.status === 'pr_open' ? 'var(--green)' : task.status === 'paused' ? 'var(--purple)' : 'transparent'}` }}
     >
-      <div className="task-card-header">
-        <a
-          href={JIRA_BASE + task.jira_key}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="task-jira-key"
-          onClick={(e) => e.stopPropagation()}
-        >
-          {task.jira_key}
-        </a>
-        <span className={`status-badge ${task.status}`}>
-          {statusLabels[task.status] || task.status}
-        </span>
-      </div>
-      {task.title && <div className="task-card-title">{task.title}</div>}
-      <div className="task-card-meta">
-        <span className="task-repo">{task.repo}</span>
-        {task.pr_number && (
-          <a
-            href={task.pr_url || '#'}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="task-pr"
-            onClick={(e) => e.stopPropagation()}
-          >
-            PR #{task.pr_number}
-          </a>
-        )}
-        <span className="task-created" title={task.created_at}>
-          {timeAgo(task.created_at)}
-        </span>
-        {task.last_addressed && (
-          <span className="task-activity" title={task.last_addressed}>
-            active {timeAgo(task.last_addressed)}
-          </span>
-        )}
-      </div>
-      {step && <div className="task-step">Step: {step}</div>}
-      {task.paused_reason && (
-        <div className="task-paused-reason">{task.paused_reason}</div>
-      )}
-    </div>
+      <CardHeader
+        actions={{ actions: <Label color={statusColors[task.status] || 'grey'}>{statusLabels[task.status] || task.status}</Label> }}
+      >
+        <CardTitle>
+          {url ? (
+            <a href={url} target="_blank" rel="noopener noreferrer" onClick={(e) => e.stopPropagation()} style={{ fontWeight: 600 }}>
+              {key}
+            </a>
+          ) : (
+            <span style={{ fontWeight: 600 }}>{key}</span>
+          )}
+        </CardTitle>
+      </CardHeader>
+      <CardBody>
+        <Flex direction={{ default: 'column' }} gap={{ default: 'gapSm' }}>
+          {task.title && (
+            <FlexItem>
+              <Content component="p" style={{ margin: 0 }}>{task.title}</Content>
+            </FlexItem>
+          )}
+          <FlexItem>
+            <LabelGroup>
+              <Label variant="outline">{task.repo}</Label>
+              {firstArtifact && (
+                <span onClick={(e) => e.stopPropagation()}>
+                  <Label color="blue" href={firstArtifact.url}>
+                    {firstArtifact.name}
+                  </Label>
+                </span>
+              )}
+              <Label variant="outline">{timeAgo(task.created_at)}</Label>
+              {task.last_addressed && (
+                <Label variant="outline">active {timeAgo(task.last_addressed)}</Label>
+              )}
+            </LabelGroup>
+          </FlexItem>
+          {task.instance_id && (
+            <FlexItem>
+              <Label variant="outline" color="grey">{task.instance_id}</Label>
+            </FlexItem>
+          )}
+          {task.paused_reason && (
+            <FlexItem>
+              <Content component="p" style={{ margin: 0, color: 'var(--yellow)', fontSize: '13px' }}>
+                <Icon status="warning" size="sm"><ExclamationTriangleIcon /></Icon>{' '}
+                {task.paused_reason}
+              </Content>
+            </FlexItem>
+          )}
+          {task.slack_notification && (
+            <FlexItem>
+              <Label variant="outline" icon={<span>🔔</span>}>
+                {task.slack_notification.event_type.replace(/_/g, ' ')} · {timeAgo(task.slack_notification.sent_at)}
+              </Label>
+            </FlexItem>
+          )}
+        </Flex>
+      </CardBody>
+    </Card>
   );
 }

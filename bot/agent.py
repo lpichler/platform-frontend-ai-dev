@@ -1,5 +1,6 @@
 """Core agent cycle — invokes Claude Agent SDK."""
 
+import json
 import logging
 import os
 from dataclasses import dataclass
@@ -8,26 +9,38 @@ import httpx
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
+    HookMatcher,
     ResultMessage,
     SystemMessage,
     TextBlock,
+    ToolResultBlock,
     query,
 )
 
 from .config import Config
+from .constants import MEMORY_API_BASE
 
 logger = logging.getLogger(__name__)
 
-DASHBOARD_URL = os.environ.get("BOT_DASHBOARD_URL", "http://localhost:8080/api/bot-status")
+TURN_WARNING_THRESHOLD = 0.75  # warn at 75% of max_turns
+TURN_CRITICAL_THRESHOLD = 0.90  # urgent at 90%
+
+DASHBOARD_URL = os.environ.get("BOT_DASHBOARD_URL", f"{MEMORY_API_BASE}/bot-status")
+
+# Track consecutive status push failures for warning after N misses
+_status_fail_count = 0
+_STATUS_FAIL_WARNING_THRESHOLD = 5
 
 
 @dataclass
 class CycleContext:
     """Tracks what work was done during a cycle."""
+
     jira_key: str | None = None
     repo: str | None = None
     work_type: str | None = None
     summary: str | None = None
+    task_id: int | None = None
 
 
 async def _push_status(
@@ -38,14 +51,27 @@ async def _push_status(
     repo: str | None = None,
 ) -> None:
     """Push a status update to the dashboard banner via HTTP."""
+    global _status_fail_count
     try:
         await client.post(
             DASHBOARD_URL,
-            json={"state": state, "message": message, "jira_key": jira_key, "repo": repo},
+            json={
+                "state": state,
+                "message": message,
+                "external_key": jira_key,
+                "repo": repo,
+            },
             timeout=2.0,
         )
-    except Exception:
-        pass  # Dashboard may be down — don't break the bot
+        _status_fail_count = 0
+    except Exception as e:
+        _status_fail_count += 1
+        logger.debug("Dashboard push failed: %s", e)
+        if _status_fail_count == _STATUS_FAIL_WARNING_THRESHOLD:
+            logger.warning(
+                "Dashboard unreachable (%d consecutive failures, silencing)",
+                _STATUS_FAIL_WARNING_THRESHOLD,
+            )
 
 
 def _describe_tool_use(block) -> str:
@@ -86,14 +112,58 @@ def _describe_tool_use(block) -> str:
         return name
 
 
+def _make_turn_budget_hook(max_turns: int):
+    """Create a PostToolUse hook that injects turn budget warnings."""
+    turn_count = {"n": 0, "warned": False, "critical": False}
+    warn_at = int(max_turns * TURN_WARNING_THRESHOLD)
+    critical_at = int(max_turns * TURN_CRITICAL_THRESHOLD)
+
+    async def hook(input_data, tool_use_id, context):
+        turn_count["n"] += 1
+        n = turn_count["n"]
+
+        if n >= critical_at and not turn_count["critical"]:
+            turn_count["critical"] = True
+            remaining = max_turns - n
+            logger.warning("Turn budget critical: %d/%d used", n, max_turns)
+            return {
+                "systemMessage": (
+                    f"TURN BUDGET CRITICAL: ~{n}/{max_turns} tool calls used, "
+                    f"~{remaining} remaining. You MUST save progress NOW via "
+                    "task_update with current summary, last_step, files_changed, "
+                    "and next_step. Then wrap up or stop."
+                ),
+            }
+
+        if n >= warn_at and not turn_count["warned"]:
+            turn_count["warned"] = True
+            remaining = max_turns - n
+            logger.info("Turn budget warning: %d/%d used", n, max_turns)
+            return {
+                "systemMessage": (
+                    f"TURN BUDGET WARNING: ~{n}/{max_turns} tool calls used, "
+                    f"~{remaining} remaining. Save progress via task_update soon "
+                    "(summary + metadata with last_step, files_changed, next_step). "
+                    "Prioritize completing current step and saving state."
+                ),
+            }
+
+        return {}
+
+    return hook
+
+
 async def run_cycle(
     label: str,
     config: Config,
     mcp_servers: dict,
     allowed_tools: list[str],
     cwd: str,
+    instance_id: str | None = None,
+    preflight_prompt: str | None = None,
 ) -> tuple[ResultMessage | None, CycleContext]:
     """Run a single bot cycle via the Claude Agent SDK."""
+    turn_hook = _make_turn_budget_hook(config.max_turns)
     options = ClaudeAgentOptions(
         model=config.model,
         max_turns=config.max_turns,
@@ -102,16 +172,43 @@ async def run_cycle(
         setting_sources=["project"],
         cwd=cwd,
         permission_mode="acceptEdits",
+        hooks={
+            "PostToolUse": [HookMatcher(hooks=[turn_hook])],
+        },
     )
 
-    prompt = (
-        f"Your primary label is: {label}. "
-        "Follow the instructions in CLAUDE.md. "
+    instance_line = (
+        f' Your instance ID is: {instance_id}. Pass instance_id="{instance_id}"'
+        f" to ALL task tool calls (task_list, task_add, task_update, task_check_capacity, bot_status_update)."
+        if instance_id
+        else ""
+    )
+
+    caveman_line = (
         "IMPORTANT: Use ULTRA caveman output for all internal text — "
         "drop articles, filler, hedging, conjunctions. Abbreviate: DB/auth/config/req/res/fn/impl/env/dep/pkg. "
         "Arrows for causality (X → Y). One word when one word enough. "
         "Normal language ONLY for Jira comments, PR descriptions, commit messages."
     )
+
+    if preflight_prompt:
+        prompt = (
+            f"Your primary label is: {label}.{instance_line} "
+            "Follow the instructions in CLAUDE.md. "
+            f"{caveman_line}\n\n"
+            "## Pre-flight Data\n\n"
+            "The following data was gathered by pre-flight scripts. "
+            "Do NOT re-fetch task statuses, PR statuses, or Jira comments already shown below. "
+            "Do NOT invoke /triage — triage data is already provided.\n\n"
+            f"{preflight_prompt}"
+        )
+    else:
+        prompt = (
+            f"Your primary label is: {label}.{instance_line} "
+            "Follow the instructions in CLAUDE.md. "
+            "Start by invoking the /triage skill to pre-gather task and PR data. "
+            f"{caveman_line}"
+        )
 
     result = None
     ctx = CycleContext()
@@ -143,22 +240,17 @@ async def run_cycle(
                                 # Log full text (truncated)
                                 logger.info("[agent] %s", text[:300])
                                 # Push to dashboard
-                                await _push_status(
-                                    http, "working", text[:500]
-                                )
+                                await _push_status(http, "working", text[:500])
+                        elif isinstance(block, ToolResultBlock):
+                            _extract_task_id_from_result(block, ctx)
                         elif hasattr(block, "name"):
                             desc = _describe_tool_use(block)
                             logger.info("[tool] %s", desc)
-                            # Extract work context from MCP tool calls
                             _extract_context(block, ctx)
 
                 elif isinstance(message, ResultMessage):
                     result = message
-                    cost = (
-                        f"${message.total_cost_usd:.4f}"
-                        if message.total_cost_usd is not None
-                        else "N/A"
-                    )
+                    cost = f"${message.total_cost_usd:.4f}" if message.total_cost_usd is not None else "N/A"
                     logger.info(
                         "Cycle done: %s | turns=%s | cost=%s | duration=%sms",
                         message.subtype,
@@ -185,7 +277,7 @@ async def run_cycle(
         # Extract a short summary from the result text
         if not ctx.summary and result_text:
             # Take the last meaningful line (usually the conclusion)
-            lines = [l.strip() for l in result_text.strip().splitlines() if l.strip()]
+            lines = [line.strip() for line in result_text.strip().splitlines() if line.strip()]
             if lines:
                 ctx.summary = lines[-1][:200]
 
@@ -242,3 +334,38 @@ def _extract_context(block, ctx: CycleContext) -> None:
     # Memory housekeeping
     elif name == "mcp__bot-memory__memory_delete":
         ctx.work_type = ctx.work_type or "memory_housekeeping"
+
+    # progress_store carries jira_key in progress dict
+    elif name == "mcp__bot-memory__progress_store":
+        progress = inp.get("progress") or {}
+        if isinstance(progress, dict):
+            if progress.get("jira_key"):
+                ctx.jira_key = ctx.jira_key or progress["jira_key"]
+            if progress.get("repo"):
+                ctx.repo = ctx.repo or progress["repo"]
+
+
+def _extract_task_id_from_result(block: ToolResultBlock, ctx: CycleContext) -> None:
+    """Extract task_id from MCP tool result content.
+
+    Matches task objects (task_add/get/update → {id, jira_key, ...})
+    and cycle run objects (progress_store → {task_id, cycle_type, ...}).
+    """
+    content = block.content
+    if not content:
+        return
+    try:
+        text = content if isinstance(content, str) else content[0].get("text", "") if isinstance(content, list) else ""
+        if not text:
+            return
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            return
+        # Task objects: {id: int, external_key: ...}
+        if isinstance(data.get("id"), int) and ("external_key" in data or "jira_key" in data):
+            ctx.task_id = data["id"]
+        # Cycle run objects from progress_store: {task_id: int, cycle_type: ...}
+        elif isinstance(data.get("task_id"), int) and data["task_id"] > 0:
+            ctx.task_id = data["task_id"]
+    except (json.JSONDecodeError, TypeError, IndexError, AttributeError):
+        pass

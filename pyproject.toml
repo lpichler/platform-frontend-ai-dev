@@ -7,7 +7,21 @@ dependencies = [
     "claude-agent-sdk",
     "filelock",
     "httpx",
+    "jinja2>=3.1",
+    "jsonschema>=4.20",
     "python-dotenv",
+    "pyyaml>=6.0",
+    "zstandard>=0.23",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.1.0",
+    "pre-commit",
+    "httpx>=0.27.0",
+    "mcp>=1.1.0",
+    "ruff>=0.8.0",
 ]
 
 [build-system]
@@ -19,6 +33,39 @@ packages = ["bot"]
 
 [project.scripts]
 dev-bot = "bot.run:main"
+
+[tool.pytest.ini_options]
+testpaths = [
+    "bot/tests",
+    "presets/shared/skills/auto-fork/tests",
+    "presets/shared/skills/post-pr/tests",
+    "presets/shared/skills/push-and-pr/tests",
+    "presets/workflows/jira-sprint/skills/claim-ticket/tests",
+    "presets/workflows/jira-kanban/skills/claim-ticket/tests",
+    "presets/workflows/onboarding/skills/generate-instance/tests",
+    "presets/workflows/onboarding/skills/generate-konflux/tests",
+    "presets/workflows/onboarding/skills/generate-app-interface/tests",
+    "presets/workflows/onboarding/skills/post-plan/tests",
+    "presets/workflows/onboarding/skills/post-manual-steps/tests",
+    "presets/workflows/onboarding/skills/post-konflux-questions/tests",
+    "presets/workflows/onboarding/skills/post-konflux-instructions/tests",
+    "presets/workflows/onboarding/skills/post-intake/tests",
+]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --strict-markers --strict-config --tb=short --import-mode=importlib"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "C4"]
+
+[tool.ruff.lint.per-file-ignores]
+"*/tests/*" = ["E501"]
+"memory-server/seed_from_json.py" = ["E501"]
 
 [tool.uv.workspace]
 members = ["memory-server"]

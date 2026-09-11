@@ -1,0 +1,1371 @@
+"""REST API endpoints for the web dashboard."""
+
+import base64
+import json
+import logging
+import os
+from datetime import date as date_type
+from datetime import datetime
+
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
+
+from .db import get_pool
+from .embeddings import embed
+from .events import Event, bus
+from .tools.tasks import ACTIVE_STATUSES
+
+logger = logging.getLogger(__name__)
+
+wake_signals: set[str] = set()
+
+
+def _parse_json_field(value):
+    if isinstance(value, str):
+        return json.loads(value)
+    return value
+
+
+def _restore_status_from_row(row) -> str:
+    """Pick active status when resuming a paused/archived task.
+
+    Uses ``status_before_pause`` stored in metadata when available,
+    falling back to artifact-based heuristic.
+    """
+    meta = _parse_json_field(row.get("metadata")) or {}
+    saved = meta.get("status_before_pause")
+    if saved and saved in ACTIVE_STATUSES:
+        return saved
+    artifacts = _parse_json_field(row.get("artifacts")) or []
+    for artifact in artifacts:
+        if artifact.get("type") in ("pull_request", "merge_request"):
+            return "pr_open"
+    if meta.get("prs"):
+        return "pr_open"
+    return "in_progress"
+
+
+async def api_tasks(request: Request) -> JSONResponse:
+    pool = get_pool()
+    status = request.query_params.get("status")
+    limit = int(request.query_params.get("limit", "20"))
+    offset = int(request.query_params.get("offset", "0"))
+    instance_id = request.query_params.get("instance_id")
+
+    exclude = request.query_params.get("exclude_status")
+
+    if status:
+        base_params = [status]
+        where = "WHERE status = $1::task_status"
+        if instance_id:
+            idx = len(base_params) + 1
+            where += f" AND instance_id = ${idx}"
+            base_params.append(instance_id)
+
+        total = await pool.fetchval(f"SELECT COUNT(*) FROM tasks {where}", *base_params)
+        order_col = "last_addressed" if status == "archived" else "created_at"
+        base_params.extend([limit, offset])
+        lim_idx = len(base_params) - 1
+        off_idx = len(base_params)
+        rows = await pool.fetch(
+            f"SELECT * FROM tasks {where} ORDER BY {order_col} DESC LIMIT ${lim_idx} OFFSET ${off_idx}",
+            *base_params,
+        )
+    elif exclude:
+        base_params = [exclude]
+        where = "WHERE status != $1::task_status"
+        if instance_id:
+            idx = len(base_params) + 1
+            where += f" AND instance_id = ${idx}"
+            base_params.append(instance_id)
+
+        total = await pool.fetchval(f"SELECT COUNT(*) FROM tasks {where}", *base_params)
+        base_params.extend([limit, offset])
+        lim_idx = len(base_params) - 1
+        off_idx = len(base_params)
+        rows = await pool.fetch(
+            f"SELECT * FROM tasks {where} ORDER BY created_at DESC LIMIT ${lim_idx} OFFSET ${off_idx}",
+            *base_params,
+        )
+    else:
+        if instance_id:
+            total = await pool.fetchval("SELECT COUNT(*) FROM tasks WHERE instance_id = $1", instance_id)
+            rows = await pool.fetch(
+                "SELECT * FROM tasks WHERE instance_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
+                instance_id,
+                limit,
+                offset,
+            )
+        else:
+            total = await pool.fetchval("SELECT COUNT(*) FROM tasks")
+            rows = await pool.fetch(
+                "SELECT * FROM tasks ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+                limit,
+                offset,
+            )
+
+    # Fetch latest Slack notification per task
+    ext_keys = [r["external_key"] for r in rows]
+    notifications = {}
+    if ext_keys:
+        notif_rows = await pool.fetch(
+            """
+            SELECT DISTINCT ON (external_key) external_key, event_type, message, sent_at
+            FROM slack_notifications
+            WHERE external_key = ANY($1)
+            ORDER BY external_key, sent_at DESC
+            """,
+            ext_keys,
+        )
+        for nr in notif_rows:
+            notifications[nr["external_key"]] = {
+                "event_type": nr["event_type"],
+                "message": nr["message"],
+                "sent_at": nr["sent_at"].isoformat(),
+            }
+
+    return JSONResponse(
+        {
+            "items": [_task(r, notifications.get(r["external_key"])) for r in rows],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
+    )
+
+
+async def api_task_delete(request: Request) -> JSONResponse:
+    """Archive a task by key (soft delete — preserves history)."""
+    pool = get_pool()
+    key = request.path_params.get("key")
+    if not key:
+        return JSONResponse({"error": "missing key"}, status_code=400)
+    row = await pool.fetchrow(
+        "UPDATE tasks SET status = 'archived'::task_status WHERE external_key = $1 RETURNING *",
+        key,
+    )
+    if not row:
+        return JSONResponse({"error": f"Task {key} not found"}, status_code=404)
+    await bus.publish(Event("task_archived", {"external_key": key}))
+    return JSONResponse({"archived": True, "external_key": key, "task": _task(row)})
+
+
+async def api_task_unarchive(request: Request) -> JSONResponse:
+    """Restore an archived task so the bot can pick it up."""
+    pool = get_pool()
+    key = request.path_params.get("key")
+    if not key:
+        return JSONResponse({"error": "missing key"}, status_code=400)
+
+    existing = await pool.fetchrow(
+        "SELECT * FROM tasks WHERE external_key = $1 AND status = 'archived'::task_status",
+        key,
+    )
+    if not existing:
+        return JSONResponse({"error": f"Task {key} not found or not archived"}, status_code=404)
+
+    new_status = _restore_status_from_row(existing)
+    row = await pool.fetchrow(
+        "UPDATE tasks SET status = $2::task_status, paused_reason = NULL,"
+        " metadata = metadata - 'status_before_pause'"
+        " WHERE external_key = $1 AND status = 'archived'::task_status"
+        " RETURNING *",
+        key,
+        new_status,
+    )
+    if not row:
+        return JSONResponse({"error": f"Task {key} not found or not archived"}, status_code=404)
+
+    await bus.publish(
+        Event(
+            "task_updated",
+            {"external_key": key, "status": new_status},
+        )
+    )
+    return JSONResponse({"unarchived": True, "external_key": key, "task": _task(row)})
+
+
+async def api_task_pause(request: Request) -> JSONResponse:
+    """Pause an active task so the bot skips it until unpaused."""
+    pool = get_pool()
+    key = request.path_params.get("key")
+    if not key:
+        return JSONResponse({"error": "missing key"}, status_code=400)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    reason = None
+    if isinstance(body, dict):
+        reason = body.get("paused_reason")
+    if not reason:
+        reason = "Paused via dashboard"
+
+    row = await pool.fetchrow(
+        "UPDATE tasks SET status = 'paused'::task_status,"
+        " paused_reason = $2,"
+        " metadata = jsonb_set(COALESCE(metadata, '{}'), '{status_before_pause}', to_jsonb(status::text))"
+        " WHERE external_key = $1 AND status = ANY($3)"
+        " RETURNING *",
+        key,
+        reason,
+        list(ACTIVE_STATUSES),
+    )
+    if not row:
+        return JSONResponse({"error": f"Task {key} not found or not active"}, status_code=404)
+    await bus.publish(
+        Event(
+            "task_updated",
+            {"external_key": key, "status": "paused", "summary": reason},
+        )
+    )
+    return JSONResponse({"paused": True, "external_key": key, "task": _task(row)})
+
+
+async def api_task_unpause(request: Request) -> JSONResponse:
+    """Resume a paused task so the bot can pick it up again."""
+    pool = get_pool()
+    key = request.path_params.get("key")
+    if not key:
+        return JSONResponse({"error": "missing key"}, status_code=400)
+
+    existing = await pool.fetchrow(
+        "SELECT * FROM tasks WHERE external_key = $1 AND status = 'paused'::task_status",
+        key,
+    )
+    if not existing:
+        return JSONResponse({"error": f"Task {key} not found or not paused"}, status_code=404)
+
+    new_status = _restore_status_from_row(existing)
+    row = await pool.fetchrow(
+        "UPDATE tasks SET status = $2::task_status, paused_reason = NULL,"
+        " metadata = metadata - 'status_before_pause'"
+        " WHERE external_key = $1 AND status = 'paused'::task_status"
+        " RETURNING *",
+        key,
+        new_status,
+    )
+    if not row:
+        return JSONResponse({"error": f"Task {key} not found or not paused"}, status_code=404)
+
+    await bus.publish(
+        Event(
+            "task_updated",
+            {"external_key": key, "status": new_status},
+        )
+    )
+    return JSONResponse({"unpaused": True, "external_key": key, "task": _task(row)})
+
+
+async def api_memories(request: Request) -> JSONResponse:
+    pool = get_pool()
+    category = request.query_params.get("category")
+    repo = request.query_params.get("repo")
+    tag = request.query_params.get("tag")
+    limit = int(request.query_params.get("limit", "20"))
+    offset = int(request.query_params.get("offset", "0"))
+
+    conditions, params, idx = [], [], 0
+    if category:
+        idx += 1
+        conditions.append(f"category = ${idx}")
+        params.append(category)
+    if repo:
+        idx += 1
+        conditions.append(f"repo = ${idx}")
+        params.append(repo)
+    if tag:
+        idx += 1
+        conditions.append(f"${idx} = ANY(tags)")
+        params.append(tag)
+
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+    total = await pool.fetchval(f"SELECT COUNT(*) FROM memories {where}", *params)
+
+    idx += 1
+    params.append(limit)
+    limit_idx = idx
+    idx += 1
+    params.append(offset)
+    offset_idx = idx
+
+    mem_cols = "id, category, repo, external_key, source_type, title, content, tags, created_at, metadata"
+    rows = await pool.fetch(
+        f"SELECT {mem_cols} FROM memories {where} ORDER BY created_at DESC LIMIT ${limit_idx} OFFSET ${offset_idx}",
+        *params,
+    )
+    return JSONResponse(
+        {
+            "items": [_memory(r) for r in rows],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
+    )
+
+
+async def api_memory_search(request: Request) -> JSONResponse:
+    pool = get_pool()
+    query = request.query_params.get("q", "")
+    if not query:
+        return JSONResponse({"error": "missing ?q= parameter"}, status_code=400)
+
+    category = request.query_params.get("category")
+    repo = request.query_params.get("repo")
+    tag = request.query_params.get("tag")
+    limit = int(request.query_params.get("limit", "10"))
+
+    vector = embed(query)
+    conditions, params, idx = [], [vector, limit], 2
+    if category:
+        idx += 1
+        conditions.append(f"category = ${idx}")
+        params.append(category)
+    if repo:
+        idx += 1
+        conditions.append(f"repo = ${idx}")
+        params.append(repo)
+    if tag:
+        idx += 1
+        conditions.append(f"${idx} = ANY(tags)")
+        params.append(tag)
+
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    rows = await pool.fetch(
+        f"""
+        SELECT id, category, repo, external_key, source_type, title, content, tags, created_at, metadata,
+               embedding <=> $1 AS distance
+        FROM memories {where}
+        ORDER BY distance LIMIT $2
+        """,
+        *params,
+    )
+    return JSONResponse([{**_memory(r), "similarity": round(1 - r["distance"], 4)} for r in rows])
+
+
+async def api_memory_embeddings(request: Request) -> JSONResponse:
+    """Return 3D projected embeddings for visualization (PCA)."""
+    pool = get_pool()
+    rows = await pool.fetch(
+        "SELECT id, title, content, category, repo, tags, embedding FROM memories ORDER BY created_at DESC LIMIT 200"
+    )
+    if not rows:
+        return JSONResponse([])
+
+    import numpy as np
+
+    embeddings = np.array([list(r["embedding"]) for r in rows])
+
+    # Center and PCA → 3 components
+    mean = embeddings.mean(axis=0)
+    centered = embeddings - mean
+    n_components = min(3, len(rows), centered.shape[1])
+    if len(rows) > 2:
+        U, S, Vt = np.linalg.svd(centered, full_matrices=False)
+        proj = centered @ Vt[:n_components].T
+    else:
+        proj = centered[:, :n_components]
+
+    # Pad to 3D if needed
+    if proj.shape[1] < 3:
+        proj = np.pad(proj, ((0, 0), (0, 3 - proj.shape[1])))
+
+    # Normalize to [-1, 1] range for Three.js
+    max_abs = np.abs(proj).max(axis=0)
+    max_abs[max_abs == 0] = 1
+    proj = proj / max_abs
+
+    result = []
+    for i, r in enumerate(rows):
+        result.append(
+            {
+                "id": r["id"],
+                "title": r["title"],
+                "content": r["content"][:200],
+                "category": r["category"],
+                "repo": r["repo"],
+                "tags": list(r["tags"]) if r["tags"] else [],
+                "x": float(proj[i, 0]),
+                "y": float(proj[i, 1]),
+                "z": float(proj[i, 2]),
+            }
+        )
+    return JSONResponse(result)
+
+
+async def api_memory_get(request: Request) -> JSONResponse:
+    """Get a single memory by ID."""
+    pool = get_pool()
+    memory_id = request.path_params.get("id")
+    if not memory_id:
+        return JSONResponse({"error": "missing memory id"}, status_code=400)
+    mem_cols = "id, category, repo, external_key, source_type, title, content, tags, created_at, metadata"
+    row = await pool.fetchrow(
+        f"SELECT {mem_cols} FROM memories WHERE id = $1",
+        int(memory_id),
+    )
+    if not row:
+        return JSONResponse({"error": f"Memory {memory_id} not found"}, status_code=404)
+    return JSONResponse(_memory(row))
+
+
+async def api_memory_delete(request: Request) -> JSONResponse:
+    """Delete a memory by ID."""
+    pool = get_pool()
+    memory_id = request.path_params.get("id")
+    if not memory_id:
+        return JSONResponse({"error": "missing memory id"}, status_code=400)
+    result = await pool.execute("DELETE FROM memories WHERE id = $1", int(memory_id))
+    if result == "DELETE 0":
+        return JSONResponse({"error": f"Memory {memory_id} not found"}, status_code=404)
+    await bus.publish(Event("memory_deleted", {"id": int(memory_id)}))
+    return JSONResponse({"deleted": True, "id": int(memory_id)})
+
+
+async def api_memory_upload(request: Request) -> JSONResponse:
+    """POST /api/memories/upload — bulk upload memories with a shared secret."""
+    secret = os.environ.get("UPLOAD_MEMORY_PASSWORD")
+    if not secret:
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer ") or auth[7:] != secret:
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+
+    body = await request.json()
+    memories = body.get("memories", [])
+    if not memories:
+        return JSONResponse({"uploaded": 0, "errors": []})
+
+    pool = get_pool()
+    uploaded = 0
+    errors = []
+
+    for i, m in enumerate(memories):
+        try:
+            title = m["title"]
+            category = m["category"]
+            content = m["content"]
+            repo = m.get("repo")
+            tags = m.get("tags", [])
+            metadata = m.get("metadata", {})
+
+            existing = await pool.fetchval(
+                "SELECT id FROM memories WHERE title = $1 AND category = $2 AND repo IS NOT DISTINCT FROM $3",
+                title,
+                category,
+                repo,
+            )
+            if existing:
+                errors.append({"index": i, "title": title, "reason": "duplicate"})
+                continue
+
+            vector = embed(f"{title}\n{content}")
+            external_key = m.get("external_key")
+            source_type = m.get("source_type") or ("jira" if external_key else None)
+            row = await pool.fetchrow(
+                """
+                INSERT INTO memories (category, repo, title, content, tags, embedding, metadata,
+                                      external_key, source_type)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                RETURNING *
+                """,
+                category,
+                repo,
+                title,
+                content,
+                tags or [],
+                vector,
+                json.dumps(metadata or {}),
+                external_key,
+                source_type,
+            )
+            await bus.publish(
+                Event(
+                    "memory_stored",
+                    {"id": row["id"], "title": title, "category": category},
+                )
+            )
+            uploaded += 1
+        except KeyError as e:
+            errors.append({"index": i, "reason": f"missing field: {e}"})
+        except Exception as e:
+            errors.append({"index": i, "title": m.get("title", "?"), "reason": str(e)})
+
+    logger.info("Memory upload: %d uploaded, %d errors/skipped", uploaded, len(errors))
+    return JSONResponse({"uploaded": uploaded, "errors": errors})
+
+
+async def api_bot_status(request: Request) -> JSONResponse:
+    if request.method == "POST":
+        return await api_bot_status_update(request)
+    pool = get_pool()
+    row = await pool.fetchrow("SELECT * FROM bot_status WHERE id = 1")
+    if not row:
+        return JSONResponse({"state": "unknown", "message": ""})
+    return JSONResponse(
+        {
+            "state": row["state"],
+            "message": row["message"],
+            "external_key": row.get("external_key"),
+            "source_type": row.get("source_type"),
+            "repo": row["repo"],
+            "instance_id": row.get("instance_id"),
+            "cycle_start": row["cycle_start"].isoformat() if row["cycle_start"] else None,
+            "updated_at": row["updated_at"].isoformat(),
+        }
+    )
+
+
+async def api_bot_status_update(request: Request) -> JSONResponse:
+    """POST /api/bot-status — update bot status from the runner."""
+    pool = get_pool()
+    body = await request.json()
+    state = body.get("state")
+    message = body.get("message", "")
+    repo = body.get("repo")
+
+    if state not in ("working", "idle", "error"):
+        return JSONResponse({"error": "state must be working, idle, or error"}, status_code=400)
+
+    external_key = body.get("external_key")
+    source_type = body.get("source_type") or ("jira" if external_key else None)
+    row = await pool.fetchrow(
+        """
+        UPDATE bot_status SET state = $1, message = $2, external_key = $3, source_type = $4,
+            repo = $5,
+            cycle_start = CASE WHEN state = 'idle' AND $1 = 'working' THEN NOW() ELSE cycle_start END,
+            updated_at = NOW()
+        WHERE id = 1 RETURNING *
+        """,
+        state,
+        message,
+        external_key,
+        source_type,
+        repo,
+    )
+    result = {
+        "state": row["state"],
+        "message": row["message"],
+        "external_key": row.get("external_key"),
+        "source_type": row.get("source_type"),
+        "repo": row["repo"],
+        "cycle_start": row["cycle_start"].isoformat() if row["cycle_start"] else None,
+        "updated_at": row["updated_at"].isoformat(),
+    }
+    await bus.publish(Event("bot_status", result))
+    return JSONResponse(result)
+
+
+async def api_instances(request: Request) -> JSONResponse:
+    """GET /api/instances — list all bot instances with aggregated task counts."""
+    pool = get_pool()
+    instance_rows = await pool.fetch("SELECT * FROM bot_instances ORDER BY updated_at DESC")
+    # Count active tasks per instance
+    task_counts = await pool.fetch(
+        """
+        SELECT instance_id, COUNT(*) AS active
+        FROM tasks
+        WHERE status IN ('in_progress', 'pr_open', 'pr_changes')
+        AND instance_id IS NOT NULL
+        GROUP BY instance_id
+        """
+    )
+    counts_map = {r["instance_id"]: r["active"] for r in task_counts}
+
+    result = [_instance_row(r, counts_map.get(r["instance_id"], 0)) for r in instance_rows]
+    return JSONResponse(result)
+
+
+def _instance_row(r, active_tasks: int = 0) -> dict:
+    return {
+        "instance_id": r["instance_id"],
+        "state": r["state"],
+        "message": r["message"],
+        "external_key": r.get("external_key"),
+        "source_type": r.get("source_type"),
+        "repo": r["repo"],
+        "cycle_start": r["cycle_start"].isoformat() if r["cycle_start"] else None,
+        "updated_at": r["updated_at"].isoformat(),
+        "active_tasks": active_tasks,
+        "max_tasks": 10,
+        "idle_consecutive_cycles": r.get("idle_consecutive_cycles") or 0,
+        "last_idle_reminder_sent_at": (
+            r["last_idle_reminder_sent_at"].isoformat() if r.get("last_idle_reminder_sent_at") else None
+        ),
+    }
+
+
+async def api_instance_get(request: Request) -> JSONResponse:
+    """GET /api/instances/{instance_id} — fetch a single instance."""
+    pool = get_pool()
+    instance_id = request.path_params["instance_id"]
+    row = await pool.fetchrow("SELECT * FROM bot_instances WHERE instance_id = $1", instance_id)
+    if row is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return JSONResponse(_instance_row(row))
+
+
+async def api_instance_idle_update(request: Request) -> JSONResponse:
+    """PATCH /api/instances/{instance_id}/idle — update idle tracking fields."""
+    pool = get_pool()
+    instance_id = request.path_params["instance_id"]
+    body = await request.json()
+    cycles = body.get("idle_consecutive_cycles")
+    last_sent_raw = body.get("last_idle_reminder_sent_at")
+    last_sent: datetime | None = None
+    if last_sent_raw is not None:
+        try:
+            if isinstance(last_sent_raw, str):
+                last_sent = datetime.fromisoformat(last_sent_raw)
+            elif isinstance(last_sent_raw, datetime):
+                last_sent = last_sent_raw
+            else:
+                return JSONResponse({"error": "invalid last_idle_reminder_sent_at"}, status_code=400)
+        except ValueError:
+            return JSONResponse({"error": "invalid last_idle_reminder_sent_at"}, status_code=400)
+    row = await pool.fetchrow(
+        """
+        INSERT INTO bot_instances (instance_id, idle_consecutive_cycles, last_idle_reminder_sent_at)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (instance_id) DO UPDATE SET
+            idle_consecutive_cycles    = $2,
+            last_idle_reminder_sent_at = $3
+        RETURNING *
+        """,
+        instance_id,
+        int(cycles) if cycles is not None else 0,
+        last_sent,
+    )
+    return JSONResponse(_instance_row(row))
+
+
+async def api_costs(request: Request) -> JSONResponse:
+    """GET /api/costs — list cycle cost records. POST to add one."""
+    if request.method == "POST":
+        return await api_costs_add(request)
+    pool = get_pool()
+    limit = int(request.query_params.get("limit", "200"))
+    date_filter, date_params = _parse_date_filter(request)
+
+    pidx = len(date_params) + 1
+    rows = await pool.fetch(
+        f"SELECT * FROM cycles WHERE {date_filter} ORDER BY timestamp DESC LIMIT ${pidx}",
+        *date_params,
+        limit,
+    )
+    items = [_cycle(r) for r in rows]
+
+    # Daily aggregates
+    daily_rows = await pool.fetch(
+        f"""
+        SELECT DATE(timestamp) AS day,
+               COUNT(*) AS cycles,
+               SUM(cost_usd) AS total_cost,
+               SUM(input_tokens) AS input_tokens,
+               SUM(output_tokens) AS output_tokens,
+               SUM(cache_read_tokens) AS cache_read,
+               SUM(cache_write_tokens) AS cache_write,
+               SUM(duration_ms) AS total_duration,
+               SUM(num_turns) AS total_turns,
+               SUM(CASE WHEN no_work THEN 1 ELSE 0 END) AS idle_cycles,
+               SUM(CASE WHEN is_error THEN 1 ELSE 0 END) AS error_cycles
+        FROM cycles
+        WHERE {date_filter}
+        GROUP BY DATE(timestamp)
+        ORDER BY day DESC
+        """,
+        *date_params,
+    )
+    daily = [
+        {
+            "day": str(r["day"]),
+            "cycles": r["cycles"],
+            "total_cost": float(r["total_cost"] or 0),
+            "input_tokens": r["input_tokens"],
+            "output_tokens": r["output_tokens"],
+            "cache_read": r["cache_read"],
+            "cache_write": r["cache_write"],
+            "total_duration": r["total_duration"],
+            "total_turns": r["total_turns"],
+            "idle_cycles": r["idle_cycles"],
+            "error_cycles": r["error_cycles"],
+        }
+        for r in daily_rows
+    ]
+
+    return JSONResponse({"items": items, "daily": daily})
+
+
+async def api_costs_add(request: Request) -> JSONResponse:
+    """POST /api/costs — record a new cycle cost entry."""
+    pool = get_pool()
+    body = await request.json()
+
+    external_key = body.get("external_key")
+    source_type = body.get("source_type") or ("jira" if external_key else None)
+    row = await pool.fetchrow(
+        """
+        INSERT INTO cycles (label, session_id, num_turns, duration_ms, cost_usd,
+                            input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                            model, is_error, no_work,
+                            external_key, source_type, repo, work_type, summary)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+        RETURNING *
+        """,
+        body.get("label", ""),
+        body.get("session_id", ""),
+        body.get("num_turns", 0),
+        body.get("duration_ms", 0),
+        body.get("cost_usd", 0),
+        body.get("input_tokens", 0),
+        body.get("output_tokens", 0),
+        body.get("cache_read_tokens", 0),
+        body.get("cache_write_tokens", 0),
+        body.get("model", ""),
+        body.get("is_error", False),
+        body.get("no_work", False),
+        external_key,
+        source_type,
+        body.get("repo"),
+        body.get("work_type"),
+        body.get("summary"),
+    )
+    cycle = _cycle(row)
+    await bus.publish(Event("cycle_recorded", cycle))
+    return JSONResponse(cycle, status_code=201)
+
+
+def _parse_date_filter(request: Request):
+    """Build date filter clause + params from request query params."""
+    days = int(request.query_params.get("days", "30"))
+    date_from = request.query_params.get("from")
+    date_to = request.query_params.get("to")
+
+    if date_from and date_to:
+        return (
+            "timestamp >= $1 AND timestamp < ($2 + interval '1 day')",
+            [date_type.fromisoformat(date_from), date_type.fromisoformat(date_to)],
+        )
+    if date_from:
+        return "timestamp >= $1", [date_type.fromisoformat(date_from)]
+    if date_to:
+        return "timestamp < ($1 + interval '1 day')", [date_type.fromisoformat(date_to)]
+    return "timestamp > NOW() - make_interval(days => $1)", [days]
+
+
+async def api_analytics(request: Request) -> JSONResponse:
+    """GET /api/analytics — aggregated stats for the analytics dashboard."""
+    pool = get_pool()
+    date_filter, date_params = _parse_date_filter(request)
+
+    # Work type breakdown (derived from ticket titles + work_type)
+    work_type_rows = await pool.fetch(
+        f"""
+        SELECT
+            CASE
+                WHEN summary ILIKE '%%investigation%%' OR work_type = 'investigation' THEN 'investigation'
+                WHEN external_key IS NOT NULL AND (
+                    summary ILIKE '%%CVE%%' OR summary ILIKE '%%cve%%'
+                    OR external_key IN (SELECT DISTINCT external_key FROM tasks WHERE title ILIKE '%%CVE%%')
+                ) THEN 'cve'
+                WHEN work_type = 'pr_review' THEN 'pr_review'
+                WHEN work_type = 'new_ticket' THEN 'new_ticket'
+                WHEN no_work THEN 'idle'
+                WHEN is_error THEN 'error'
+                ELSE 'other'
+            END AS category,
+            COUNT(*) AS cycles,
+            ROUND(SUM(cost_usd)::numeric, 2) AS total_cost,
+            ROUND(AVG(cost_usd)::numeric, 2) AS avg_cost,
+            ROUND(AVG(num_turns)::numeric, 1) AS avg_turns,
+            ROUND(AVG(duration_ms)::numeric, 0) AS avg_duration_ms
+        FROM cycles
+        WHERE {date_filter}
+        GROUP BY category
+        ORDER BY cycles DESC
+        """,
+        *date_params,
+    )
+
+    # Per-repo breakdown
+    repo_rows = await pool.fetch(
+        f"""
+        SELECT repo,
+            COUNT(DISTINCT external_key) AS tickets,
+            COUNT(*) AS cycles,
+            ROUND(SUM(cost_usd)::numeric, 2) AS total_cost,
+            ROUND(AVG(num_turns)::numeric, 1) AS avg_turns
+        FROM cycles
+        WHERE {date_filter} AND repo IS NOT NULL AND NOT no_work
+        GROUP BY repo
+        ORDER BY cycles DESC
+        """,
+        *date_params,
+    )
+
+    # Ticket lifecycle — cycles per ticket, impl vs review, cost, time to resolve
+    ticket_rows = await pool.fetch(
+        f"""
+        SELECT
+            c.external_key,
+            t.title,
+            t.status::text AS task_status,
+            t.repo,
+            COUNT(*) AS total_cycles,
+            SUM(CASE WHEN c.work_type = 'new_ticket' THEN 1 ELSE 0 END) AS impl_cycles,
+            SUM(CASE WHEN c.work_type = 'pr_review' THEN 1 ELSE 0 END) AS review_cycles,
+            ROUND(SUM(c.cost_usd)::numeric, 2) AS total_cost,
+            ROUND(EXTRACT(EPOCH FROM (MAX(c.timestamp) - MIN(c.timestamp)))/3600.0, 1) AS hours_span
+        FROM cycles c
+        LEFT JOIN tasks t ON t.external_key = c.external_key
+        WHERE {date_filter} AND c.external_key IS NOT NULL AND NOT c.no_work
+        GROUP BY c.external_key, t.title, t.status, t.repo
+        ORDER BY total_cycles DESC
+        LIMIT 30
+        """,
+        *date_params,
+    )
+
+    # Summary stats
+    summary = await pool.fetchrow(
+        f"""
+        SELECT
+            COUNT(*) AS total_cycles,
+            COUNT(DISTINCT external_key) FILTER (WHERE external_key IS NOT NULL AND NOT no_work) AS unique_tickets,
+            ROUND(SUM(cost_usd)::numeric, 2) AS total_cost,
+            ROUND(AVG(cost_usd) FILTER (WHERE NOT no_work)::numeric, 2) AS avg_cost_per_work_cycle,
+            ROUND(AVG(num_turns) FILTER (WHERE NOT no_work)::numeric, 1) AS avg_turns,
+            ROUND(AVG(duration_ms) FILTER (WHERE NOT no_work)::numeric, 0) AS avg_duration_ms,
+            COUNT(*) FILTER (WHERE no_work) AS idle_cycles,
+            COUNT(*) FILTER (WHERE is_error) AS error_cycles,
+            COUNT(*) FILTER (WHERE NOT no_work AND NOT is_error) AS work_cycles,
+            COUNT(DISTINCT repo) FILTER (WHERE repo IS NOT NULL) AS repos_touched
+        FROM cycles
+        WHERE {date_filter}
+        """,
+        *date_params,
+    )
+
+    # Tickets resolved (archived) in period
+    resolved = await pool.fetchval(
+        """
+        SELECT COUNT(*) FROM tasks
+        WHERE status = 'archived'
+        AND last_addressed >= NOW() - make_interval(days => $1)
+        """,
+        date_params[0] if isinstance(date_params[0], int) else 365,
+    )
+
+    # Avg review rounds per ticket
+    avg_reviews = await pool.fetchrow(
+        f"""
+        SELECT
+            ROUND(AVG(review_count)::numeric, 1) AS avg_review_rounds,
+            COUNT(*) FILTER (WHERE review_count = 0) AS zero_review,
+            COUNT(*) FILTER (WHERE review_count = 1) AS one_review,
+            COUNT(*) FILTER (WHERE review_count > 1) AS multi_review
+        FROM (
+            SELECT external_key, COUNT(*) FILTER (WHERE work_type = 'pr_review') AS review_count
+            FROM cycles
+            WHERE {date_filter} AND external_key IS NOT NULL AND NOT no_work
+            GROUP BY external_key
+        ) sub
+        """,
+        *date_params,
+    )
+
+    return JSONResponse(
+        {
+            "summary": {
+                "total_cycles": summary["total_cycles"],
+                "work_cycles": summary["work_cycles"],
+                "idle_cycles": summary["idle_cycles"],
+                "error_cycles": summary["error_cycles"],
+                "unique_tickets": summary["unique_tickets"],
+                "total_cost": float(summary["total_cost"] or 0),
+                "avg_cost_per_work_cycle": float(summary["avg_cost_per_work_cycle"] or 0),
+                "avg_turns": float(summary["avg_turns"] or 0),
+                "avg_duration_ms": float(summary["avg_duration_ms"] or 0),
+                "repos_touched": summary["repos_touched"],
+                "tickets_resolved": resolved,
+            },
+            "work_types": [
+                {
+                    "category": r["category"],
+                    "cycles": r["cycles"],
+                    "total_cost": float(r["total_cost"]),
+                    "avg_cost": float(r["avg_cost"]),
+                    "avg_turns": float(r["avg_turns"]),
+                    "avg_duration_ms": float(r["avg_duration_ms"]),
+                }
+                for r in work_type_rows
+            ],
+            "repos": [
+                {
+                    "repo": r["repo"],
+                    "tickets": r["tickets"],
+                    "cycles": r["cycles"],
+                    "total_cost": float(r["total_cost"]),
+                    "avg_turns": float(r["avg_turns"]),
+                }
+                for r in repo_rows
+            ],
+            "tickets": [
+                {
+                    "external_key": r["external_key"],
+                    "title": r["title"],
+                    "status": r["task_status"],
+                    "repo": r["repo"],
+                    "total_cycles": r["total_cycles"],
+                    "impl_cycles": r["impl_cycles"],
+                    "review_cycles": r["review_cycles"],
+                    "total_cost": float(r["total_cost"]),
+                    "hours_span": float(r["hours_span"] or 0),
+                }
+                for r in ticket_rows
+            ],
+            "feedback": {
+                "avg_review_rounds": float(avg_reviews["avg_review_rounds"] or 0),
+                "zero_review": avg_reviews["zero_review"],
+                "one_review": avg_reviews["one_review"],
+                "multi_review": avg_reviews["multi_review"],
+            },
+        }
+    )
+
+
+async def api_tags(request: Request) -> JSONResponse:
+    pool = get_pool()
+    rows = await pool.fetch("SELECT DISTINCT unnest(tags) AS tag FROM memories ORDER BY tag")
+    return JSONResponse([r["tag"] for r in rows])
+
+
+async def api_stats(request: Request) -> JSONResponse:
+    pool = get_pool()
+    tasks_by_status = await pool.fetch("SELECT status::text, COUNT(*) as count FROM tasks GROUP BY status")
+    memory_count = await pool.fetchval("SELECT COUNT(*) FROM memories")
+    memories_by_cat = await pool.fetch("SELECT category, COUNT(*) as count FROM memories GROUP BY category")
+    memories_by_repo = await pool.fetch(
+        "SELECT COALESCE(repo, 'unset') as repo, COUNT(*) as count FROM memories GROUP BY repo ORDER BY count DESC"
+    )
+    return JSONResponse(
+        {
+            "tasks": {r["status"]: r["count"] for r in tasks_by_status},
+            "memories": {
+                "total": memory_count,
+                "by_category": {r["category"]: r["count"] for r in memories_by_cat},
+                "by_repo": {r["repo"]: r["count"] for r in memories_by_repo},
+            },
+        }
+    )
+
+
+_CYCLE_RUN_LIST_COLUMNS = (
+    "id, task_id, cycle_type, instance_id, started_at, finished_at, "
+    "tool_calls, tokens_used, progress, input_prompt, created_at, "
+    "(transcript IS NOT NULL) AS has_transcript"
+)
+
+
+async def api_cycle_runs(request: Request) -> JSONResponse:
+    """GET /api/cycle-runs — list cycle runs, filterable.
+    POST /api/cycle-runs — store a new cycle run (with optional transcript)."""
+    if request.method == "POST":
+        return await api_cycle_runs_add(request)
+
+    pool = get_pool()
+    task_id = request.query_params.get("task_id")
+    instance_id = request.query_params.get("instance_id")
+    cycle_type = request.query_params.get("cycle_type")
+    limit = int(request.query_params.get("limit", "50"))
+    offset = int(request.query_params.get("offset", "0"))
+
+    conditions, params, idx = [], [], 0
+    if task_id == "none":
+        conditions.append("task_id IS NULL")
+    elif task_id:
+        idx += 1
+        conditions.append(f"task_id = ${idx}")
+        params.append(int(task_id))
+    if instance_id:
+        idx += 1
+        conditions.append(f"instance_id = ${idx}")
+        params.append(instance_id)
+    if cycle_type:
+        idx += 1
+        conditions.append(f"cycle_type = ${idx}")
+        params.append(cycle_type)
+
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+    total = await pool.fetchval(f"SELECT COUNT(*) FROM cycle_runs {where}", *params)
+
+    idx += 1
+    params.append(limit)
+    limit_idx = idx
+    idx += 1
+    params.append(offset)
+    offset_idx = idx
+
+    rows = await pool.fetch(
+        f"""
+        SELECT {_CYCLE_RUN_LIST_COLUMNS}
+        FROM cycle_runs {where}
+        ORDER BY created_at DESC
+        LIMIT ${limit_idx} OFFSET ${offset_idx}
+        """,
+        *params,
+    )
+
+    return JSONResponse(
+        {
+            "items": [_cycle_run(r) for r in rows],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
+    )
+
+
+async def api_cycle_runs_add(request: Request) -> JSONResponse:
+    """POST /api/cycle-runs — store a cycle run with optional base64 transcript."""
+    pool = get_pool()
+    body = await request.json()
+
+    task_id = body.get("task_id")
+    if task_id is not None:
+        task_id = int(task_id) if task_id else None
+
+    progress = body.get("progress")
+    if isinstance(progress, str):
+        progress = json.loads(progress)
+
+    if not task_id and progress:
+        ext_key = progress.get("external_key")
+        if ext_key:
+            row = await pool.fetchrow(
+                "SELECT id FROM tasks WHERE external_key = $1 AND source_type = 'jira'",
+                ext_key,
+            )
+            if row:
+                task_id = row["id"]
+
+    transcript_bytes = None
+    transcript_b64 = body.get("transcript_b64")
+    if transcript_b64:
+        transcript_bytes = base64.b64decode(transcript_b64)
+
+    started_at = body.get("started_at")
+    finished_at = body.get("finished_at")
+    parsed_started = datetime.fromisoformat(started_at) if started_at else None
+    parsed_finished = datetime.fromisoformat(finished_at) if finished_at else None
+
+    instance_id_val = body.get("instance_id")
+    input_prompt = body.get("input_prompt")
+
+    # When uploading a transcript, attach it to the most recent cycle_run
+    # for this specific instance that has no transcript yet (created by
+    # progress_store during the same cycle).
+    row = None
+    if transcript_bytes and instance_id_val:
+        row = await pool.fetchrow(
+            f"""
+            UPDATE cycle_runs
+            SET transcript = $1,
+                finished_at = COALESCE($2, finished_at, NOW()),
+                tool_calls = COALESCE($3, tool_calls),
+                tokens_used = COALESCE($4, tokens_used),
+                task_id = COALESCE(task_id, $5),
+                input_prompt = COALESCE($7, input_prompt)
+            WHERE id = (
+                SELECT id FROM cycle_runs
+                WHERE instance_id = $6
+                  AND transcript IS NULL
+                  AND created_at > NOW() - INTERVAL '2 hours'
+                ORDER BY created_at DESC
+                LIMIT 1
+            )
+            RETURNING {_CYCLE_RUN_LIST_COLUMNS}
+            """,
+            transcript_bytes,
+            parsed_finished,
+            body.get("tool_calls"),
+            body.get("tokens_used"),
+            task_id,
+            instance_id_val,
+            input_prompt,
+        )
+
+    if row is None:
+        row = await pool.fetchrow(
+            f"""
+            INSERT INTO cycle_runs (task_id, cycle_type, instance_id, started_at, finished_at,
+                                    tool_calls, tokens_used, progress, transcript, input_prompt)
+            VALUES ($1, $2, $3, COALESCE($4, NOW()), $5, $6, $7, $8, $9, $10)
+            RETURNING {_CYCLE_RUN_LIST_COLUMNS}
+            """,
+            task_id,
+            body.get("cycle_type", "task_work"),
+            instance_id_val,
+            parsed_started,
+            parsed_finished,
+            body.get("tool_calls"),
+            body.get("tokens_used"),
+            json.dumps(progress or {}),
+            transcript_bytes,
+            input_prompt,
+        )
+    result = _cycle_run(row)
+    result["has_transcript"] = transcript_bytes is not None
+    await bus.publish(
+        Event(
+            "cycle_run_added",
+            {
+                "id": result["id"],
+                "task_id": result["task_id"],
+                "cycle_type": result["cycle_type"],
+                "instance_id": result["instance_id"],
+            },
+        )
+    )
+    return JSONResponse(result, status_code=201)
+
+
+async def api_cycle_run_transcript(request: Request) -> Response:
+    """GET /api/cycle-runs/{id}/transcript — return transcript, optionally decompressed."""
+    pool = get_pool()
+    run_id = request.path_params.get("id")
+    if not run_id:
+        return JSONResponse({"error": "missing cycle run id"}, status_code=400)
+
+    row = await pool.fetchrow("SELECT transcript FROM cycle_runs WHERE id = $1", int(run_id))
+    if not row:
+        return JSONResponse({"error": f"Cycle run {run_id} not found"}, status_code=404)
+
+    transcript = row["transcript"]
+    if transcript is None:
+        return JSONResponse({"error": f"Cycle run {run_id} has no transcript"}, status_code=404)
+
+    decompress = request.query_params.get("decompress", "").lower() in (
+        "true",
+        "1",
+        "yes",
+    )
+
+    if decompress:
+        try:
+            import zstandard as zstd
+
+            decompressor = zstd.ZstdDecompressor()
+            decompressed = decompressor.decompress(transcript)
+            return Response(
+                content=decompressed,
+                media_type="application/x-ndjson",
+            )
+        except Exception as e:
+            return JSONResponse({"error": f"Decompression failed: {e}"}, status_code=500)
+
+    return Response(
+        content=bytes(transcript),
+        media_type="application/zstd",
+    )
+
+
+async def api_cycle_runs_by_task(request: Request) -> JSONResponse:
+    """GET /api/cycle-runs/by-task — cycle runs grouped by task with summary stats.
+
+    Merges orphan cycle_runs (task_id=NULL) with task-linked runs when they
+    share the same external_key. Uses a resolved_key CTE so that
+    orphan runs don't create duplicate groups.
+    """
+    pool = get_pool()
+    instance_id = request.query_params.get("instance_id")
+
+    conditions, params, idx = [], [], 0
+    if instance_id:
+        idx += 1
+        conditions.append(f"cr.instance_id = ${idx}")
+        params.append(instance_id)
+
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+    rows = await pool.fetch(
+        f"""
+        WITH resolved AS (
+            SELECT
+                cr.*,
+                COALESCE(t_direct.id, t_key.id) AS resolved_task_id,
+                COALESCE(
+                    t_direct.external_key,
+                    t_key.external_key,
+                    cr.progress->>'external_key'
+                ) AS resolved_key,
+                COALESCE(t_direct.title, t_key.title) AS resolved_title,
+                COALESCE(t_direct.status, t_key.status) AS resolved_status,
+                COALESCE(t_direct.repo, t_key.repo, cr.progress->>'repo') AS resolved_repo,
+                COALESCE(t_direct.source_type, t_key.source_type) AS resolved_source_type
+            FROM cycle_runs cr
+            LEFT JOIN tasks t_direct ON t_direct.id = cr.task_id
+            LEFT JOIN tasks t_key ON cr.task_id IS NULL
+                AND t_key.external_key = cr.progress->>'external_key'
+                AND t_key.source_type = 'jira'
+            {where}
+        )
+        SELECT
+            MAX(resolved_task_id) AS task_id,
+            resolved_key AS external_key,
+            MAX(resolved_source_type) AS source_type,
+            MAX(resolved_title) AS title,
+            MAX(resolved_status::text) AS task_status,
+            MAX(resolved_repo) AS repo,
+            COUNT(*) AS cycle_count,
+            COUNT(*) FILTER (WHERE transcript IS NOT NULL) AS transcript_count,
+            SUM(tool_calls) AS total_tool_calls,
+            SUM(tokens_used) AS total_tokens,
+            MIN(started_at) AS first_cycle,
+            MAX(started_at) AS last_cycle
+        FROM resolved
+        GROUP BY resolved_key
+        ORDER BY MAX(started_at) DESC
+        """,
+        *params,
+    )
+
+    groups = []
+    for r in rows:
+        groups.append(
+            {
+                "task_id": r["task_id"],
+                "external_key": r["external_key"],
+                "source_type": r["source_type"],
+                "title": r["title"],
+                "task_status": r["task_status"],
+                "repo": r["repo"],
+                "cycle_count": r["cycle_count"],
+                "transcript_count": r["transcript_count"],
+                "total_tool_calls": r["total_tool_calls"],
+                "total_tokens": r["total_tokens"],
+                "first_cycle": r["first_cycle"].isoformat() if r["first_cycle"] else None,
+                "last_cycle": r["last_cycle"].isoformat() if r["last_cycle"] else None,
+            }
+        )
+    return JSONResponse(groups)
+
+
+async def api_instance_wake_trigger(request: Request) -> JSONResponse:
+    """POST /api/instances/{instance_id}/wake — request a sleeping bot to wake up."""
+    pool = get_pool()
+    instance_id = request.path_params.get("instance_id")
+    if not instance_id:
+        return JSONResponse({"error": "missing instance_id"}, status_code=400)
+
+    row = await pool.fetchrow("SELECT instance_id FROM bot_instances WHERE instance_id = $1", instance_id)
+    if not row:
+        return JSONResponse({"error": f"Instance {instance_id} not found"}, status_code=404)
+
+    wake_signals.add(instance_id)
+    await bus.publish(Event("instance_wake", {"instance_id": instance_id}))
+    return JSONResponse({"ok": True})
+
+
+async def api_instance_wake_check(request: Request) -> JSONResponse:
+    """GET /api/instances/{instance_id}/wake — poll for a wake signal (consumed on read)."""
+    instance_id = request.path_params.get("instance_id")
+    if not instance_id:
+        return JSONResponse({"error": "missing instance_id"}, status_code=400)
+
+    if instance_id in wake_signals:
+        wake_signals.discard(instance_id)
+        return JSONResponse({"wake": True})
+    return JSONResponse({"wake": False})
+
+
+def _task(row, slack_notif=None) -> dict:
+    raw_artifacts = row.get("artifacts")
+    if isinstance(raw_artifacts, str):
+        artifacts = json.loads(raw_artifacts)
+    elif raw_artifacts is not None:
+        artifacts = raw_artifacts
+    else:
+        artifacts = []
+
+    result = {
+        "id": row["id"],
+        "external_key": row["external_key"],
+        "jira_key": row["external_key"],
+        "source_type": row["source_type"],
+        "source_url": row.get("source_url"),
+        "artifacts": artifacts,
+        "status": row["status"],
+        "repo": row["repo"],
+        "branch": row["branch"],
+        "title": row.get("title"),
+        "summary": row.get("summary"),
+        "created_at": row["created_at"].isoformat(),
+        "last_addressed": row["last_addressed"].isoformat(),
+        "paused_reason": row["paused_reason"],
+        "instance_id": row.get("instance_id"),
+        "metadata": json.loads(row["metadata"]) if isinstance(row["metadata"], str) else (row["metadata"] or {}),
+    }
+    if slack_notif:
+        result["slack_notification"] = slack_notif
+    return result
+
+
+def _cycle(row) -> dict:
+    return {
+        "id": row["id"],
+        "timestamp": row["timestamp"].isoformat(),
+        "label": row["label"],
+        "session_id": row["session_id"],
+        "num_turns": row["num_turns"],
+        "duration_ms": row["duration_ms"],
+        "cost_usd": float(row["cost_usd"]),
+        "input_tokens": row["input_tokens"],
+        "output_tokens": row["output_tokens"],
+        "cache_read_tokens": row["cache_read_tokens"],
+        "cache_write_tokens": row["cache_write_tokens"],
+        "model": row["model"],
+        "is_error": row["is_error"],
+        "no_work": row["no_work"],
+        "external_key": row.get("external_key"),
+        "source_type": row.get("source_type"),
+        "repo": row.get("repo"),
+        "work_type": row.get("work_type"),
+        "summary": row.get("summary"),
+    }
+
+
+def _memory(row) -> dict:
+    return {
+        "id": row["id"],
+        "category": row["category"],
+        "repo": row["repo"],
+        "external_key": row.get("external_key"),
+        "source_type": row.get("source_type"),
+        "title": row["title"],
+        "content": row["content"],
+        "tags": list(row["tags"]) if row["tags"] else [],
+        "created_at": row["created_at"].isoformat(),
+        "metadata": json.loads(row["metadata"]) if isinstance(row["metadata"], str) else (row["metadata"] or {}),
+    }
+
+
+def _cycle_run(row) -> dict:
+    return {
+        "id": row["id"],
+        "task_id": row["task_id"],
+        "cycle_type": row["cycle_type"],
+        "instance_id": row["instance_id"],
+        "started_at": row["started_at"].isoformat() if row["started_at"] else None,
+        "finished_at": row["finished_at"].isoformat() if row["finished_at"] else None,
+        "tool_calls": row["tool_calls"],
+        "tokens_used": row["tokens_used"],
+        "progress": json.loads(row["progress"]) if isinstance(row["progress"], str) else (row["progress"] or {}),
+        "input_prompt": row.get("input_prompt"),
+        "created_at": row["created_at"].isoformat(),
+        "has_transcript": bool(row.get("has_transcript", False)),
+    }

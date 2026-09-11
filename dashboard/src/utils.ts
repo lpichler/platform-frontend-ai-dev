@@ -21,4 +21,21 @@ export function formatTokens(n: number): string {
   return String(Math.round(n));
 }
 
-export const JIRA_BASE = 'https://redhat.atlassian.net/browse/';
+const JIRA_BASE = 'https://redhat.atlassian.net/browse/';
+
+interface SourceLike {
+  source_url?: string | null;
+  source_type?: string | null;
+  external_key?: string | null;
+}
+
+export function sourceUrl(item: SourceLike): string | null {
+  if (item.source_url) return item.source_url;
+  if (!item.external_key) return null;
+  if (item.source_type === 'jira') return JIRA_BASE + item.external_key;
+  return null;
+}
+
+export function displayKey(item: SourceLike): string {
+  return item.external_key || '';
+}
